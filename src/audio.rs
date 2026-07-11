@@ -1,4 +1,7 @@
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::{
+    path::Path,
+    sync::mpsc::{self, Receiver, Sender},
+};
 
 use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, Stream,
@@ -113,6 +116,35 @@ impl AudioEngine {
             .send(Command::AuditionStop { pitch })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
+}
+
+pub fn export_wav(project: &Project, path: &Path) -> Result<(), String> {
+    const SAMPLE_RATE: u32 = 44_100;
+    let plan = PlaybackPlan::from_project(project, SAMPLE_RATE as f32);
+    let frame_count = plan.loop_samples;
+    let (_sender, receiver) = mpsc::channel();
+    let mut renderer = Renderer::new(receiver, SAMPLE_RATE as f32);
+    renderer.plan = Some(plan);
+    let specification = hound::WavSpec {
+        channels: 2,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, specification)
+        .map_err(|error| format!("Could not create the WAV file: {error}"))?;
+    for _ in 0..frame_count {
+        let [left, right] = renderer.next_frame();
+        writer
+            .write_sample((left.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+            .and_then(|_| {
+                writer.write_sample((right.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+            })
+            .map_err(|error| format!("Could not write WAV audio: {error}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("Could not finish the WAV file: {error}"))
 }
 
 impl PlaybackPlan {
@@ -476,7 +508,8 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackPlan, add_panned, glide_frequency, held_envelope, note_envelope, pitch_frequency,
+        PlaybackPlan, add_panned, export_wav, glide_frequency, held_envelope, note_envelope,
+        pitch_frequency,
     };
     use crate::model::{Project, SimpleWaveformSynth, TrackKind};
 
@@ -569,5 +602,26 @@ mod tests {
             plan.voices[1].glide_from_frequency,
             plan.voices[0].frequency
         );
+    }
+
+    #[test]
+    fn wav_export_writes_stereo_pcm_audio() {
+        let mut project = Project::default();
+        project.bpm = 300.0;
+        project.tracks[0].add_note(69, 0, 4, 127);
+        project.tracks[0].ensure_pattern_clip();
+        let path =
+            std::env::temp_dir().join(format!("donttrackme-wav-export-{}.wav", std::process::id()));
+
+        export_wav(&project, &path).expect("test WAV should export");
+        let reader = hound::WavReader::open(&path).expect("exported WAV should open");
+        let specification = reader.spec();
+        let duration = reader.duration();
+        std::fs::remove_file(path).expect("test WAV should be removable");
+
+        assert_eq!(specification.channels, 2);
+        assert_eq!(specification.sample_rate, 44_100);
+        assert_eq!(specification.bits_per_sample, 16);
+        assert!(duration > 0);
     }
 }

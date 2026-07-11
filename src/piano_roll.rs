@@ -40,6 +40,13 @@ pub struct PianoRoll {
     drag: Option<Drag>,
     track_id: Option<u64>,
     scroll_to_middle_c: bool,
+    mouse_pitch: Option<u8>,
+}
+
+#[derive(Default)]
+pub struct PianoRollOutput {
+    pub note_on: Option<u8>,
+    pub note_off: Option<u8>,
 }
 
 impl PianoRoll {
@@ -49,12 +56,18 @@ impl PianoRoll {
         track_id: u64,
         track: &mut Track,
         auditioned_notes: &HashSet<u8>,
-    ) {
+    ) -> PianoRollOutput {
+        let mut output = PianoRollOutput::default();
         if self.track_id != Some(track_id) {
             self.selected.clear();
             self.drag = None;
             self.track_id = Some(track_id);
             self.scroll_to_middle_c = true;
+        }
+        if ui.input(|input| input.pointer.primary_released())
+            && let Some(pitch) = self.mouse_pitch.take()
+        {
+            output.note_off = Some(pitch);
         }
 
         self.keyboard_shortcuts(ui, track);
@@ -92,6 +105,16 @@ impl PianoRoll {
                 Pos2::new(grid.left(), grid.bottom() + 28.0),
                 Pos2::new(grid.right(), grid.bottom() + 28.0 + VELOCITY_HEIGHT),
             );
+            let keyboard = Rect::from_min_size(rect.min, Vec2::new(KEYBOARD_WIDTH, grid_height));
+            if ui.input(|input| input.pointer.primary_pressed())
+                && let Some(pointer) = ui.input(|input| input.pointer.press_origin())
+                && keyboard.contains(pointer)
+            {
+                let row = ((pointer.y - keyboard.top()) / KEY_HEIGHT).floor() as u8;
+                let pitch = LOWEST_PITCH + PITCH_COUNT - 1 - row;
+                self.mouse_pitch = Some(pitch);
+                output.note_on = Some(pitch);
+            }
 
             self.handle_click(ui, &response, grid, velocity, track);
             self.begin_drag(ui, &response, grid, velocity, track);
@@ -118,6 +141,7 @@ impl PianoRoll {
                 self.drag = None;
             }
         });
+        output
     }
 
     fn handle_click(
@@ -397,7 +421,8 @@ impl PianoRoll {
                 Vec2::new(KEYBOARD_WIDTH, KEY_HEIGHT),
             );
             let black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
-            let fill = if auditioned_notes.contains(&pitch) {
+            let playing = auditioned_notes.contains(&pitch) || self.mouse_pitch == Some(pitch);
+            let fill = if playing {
                 Color32::from_rgb(68, 164, 119)
             } else if selected_pitches.contains(&pitch) {
                 Color32::from_rgb(205, 133, 48)
@@ -416,7 +441,7 @@ impl PianoRoll {
                 egui::Align2::CENTER_CENTER,
                 note_name(pitch),
                 egui::FontId::monospace(11.0),
-                if black || auditioned_notes.contains(&pitch) || selected_pitches.contains(&pitch) {
+                if black || playing || selected_pitches.contains(&pitch) {
                     Color32::WHITE
                 } else {
                     Color32::BLACK

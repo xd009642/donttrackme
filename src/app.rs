@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
-    audio::AudioEngine,
+    audio::{self, AudioEngine},
     model::{Clip, ClipSourceKind, FilterKind, Project, SimpleWaveformSynth, TrackKind, Waveform},
-    piano_roll,
+    piano_roll, project_io,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +83,8 @@ pub struct DawApp {
     audio: Option<AudioEngine>,
     audio_error: Option<String>,
     auditioned_notes: HashSet<u8>,
+    project_path: Option<PathBuf>,
+    project_status: Option<String>,
 }
 
 impl DawApp {
@@ -104,6 +106,8 @@ impl DawApp {
             audio,
             audio_error,
             auditioned_notes: HashSet::new(),
+            project_path: None,
+            project_status: None,
         }
     }
 
@@ -174,10 +178,88 @@ impl DawApp {
         self.auditioned_notes = desired;
     }
 
+    fn save_project(&mut self, choose_path: bool) {
+        let path = if choose_path || self.project_path.is_none() {
+            rfd::FileDialog::new()
+                .add_filter("Don't Track Me project", &["dtm"])
+                .set_file_name("project.dtm")
+                .save_file()
+        } else {
+            self.project_path.clone()
+        };
+        let Some(path) = path else {
+            return;
+        };
+        match project_io::save(&self.project, &path) {
+            Ok(()) => {
+                self.project_path = Some(path);
+                self.project_status = Some("Project saved".to_owned());
+            }
+            Err(error) => self.project_status = Some(error),
+        }
+    }
+
+    fn load_project(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Don't Track Me project", &["dtm"])
+            .pick_file()
+        else {
+            return;
+        };
+        match project_io::load(&path) {
+            Ok(project) => {
+                if self.playing
+                    && let Some(audio) = &self.audio
+                    && let Err(error) = audio.stop()
+                {
+                    self.audio_error = Some(error);
+                }
+                self.project = project;
+                self.selected_track = self.project.tracks.first().map(|track| track.id);
+                self.selected_clip = None;
+                self.clip_drag = None;
+                self.clip_clipboard = None;
+                self.piano_roll = piano_roll::PianoRoll::default();
+                self.playing = false;
+                self.view = View::Arrangement;
+                self.project_path = Some(path);
+                self.project_status = Some("Project loaded".to_owned());
+            }
+            Err(error) => self.project_status = Some(error),
+        }
+    }
+
+    fn export_wav(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV audio", &["wav"])
+            .set_file_name("arrangement.wav")
+            .save_file()
+        else {
+            return;
+        };
+        self.project_status = Some(match audio::export_wav(&self.project, &path) {
+            Ok(()) => "WAV exported".to_owned(),
+            Err(error) => error,
+        });
+    }
+
     fn top_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("transport").show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("DON'T TRACK ME");
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    self.save_project(false);
+                }
+                if ui.button("Save as").clicked() {
+                    self.save_project(true);
+                }
+                if ui.button("Load").clicked() {
+                    self.load_project();
+                }
+                if ui.button("Export WAV").clicked() {
+                    self.export_wav();
+                }
                 ui.separator();
                 if ui
                     .button(if self.playing { "■ Stop" } else { "▶ Play" })
@@ -219,6 +301,8 @@ impl DawApp {
                     if let Some(error) = &self.audio_error {
                         ui.colored_label(Color32::from_rgb(245, 115, 105), "Audio unavailable")
                             .on_hover_text(error);
+                    } else if let Some(status) = &self.project_status {
+                        ui.label(status);
                     } else {
                         ui.label("Drop audio files anywhere to create sample tracks");
                     }
@@ -414,6 +498,17 @@ impl DawApp {
 
         ui.horizontal(|ui| {
             ui.heading("Arrangement");
+            ui.separator();
+            if ui.button("+ Instrument track").clicked() {
+                self.selected_track = Some(self.project.add_instrument());
+            }
+            if ui.button("+ Sample track").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["wav", "mp3", "flac"])
+                    .pick_file()
+            {
+                self.selected_track = Some(self.project.add_sample(path));
+            }
             ui.separator();
             ui.label("8 bars · 4/4");
             ui.separator();
@@ -680,9 +775,22 @@ impl DawApp {
             }
         });
         ui.separator();
-        if matches!(track.kind, TrackKind::Instrument { .. }) {
-            self.piano_roll
+        if let TrackKind::Instrument { synth } = track.kind {
+            let output = self
+                .piano_roll
                 .show(ui, selected, track, &self.auditioned_notes);
+            if let Some(audio) = &self.audio {
+                if let Some(pitch) = output.note_off
+                    && let Err(error) = audio.audition_stop(pitch)
+                {
+                    self.audio_error = Some(error);
+                }
+                if let Some(pitch) = output.note_on
+                    && let Err(error) = audio.audition_start(pitch, synth)
+                {
+                    self.audio_error = Some(error);
+                }
+            }
         } else {
             ui.label("Sample tracks do not have a piano roll.");
         }

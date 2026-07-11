@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod model;
 mod piano_roll;
+mod project_io;
 
 use app::DawApp;
 

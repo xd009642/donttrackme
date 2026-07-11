@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Waveform {
     Sine,
     Square,
@@ -8,14 +10,14 @@ pub enum Waveform {
     Noise,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct OscillatorLayer {
     pub waveform: Waveform,
     pub level: f32,
     pub detune_cents: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterKind {
     Off,
     LowPass,
@@ -36,7 +38,7 @@ impl FilterKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SimpleWaveformSynth {
     pub layers: [OscillatorLayer; 4],
     pub layer_count: u8,
@@ -267,13 +269,13 @@ impl Waveform {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum TrackKind {
     Instrument { synth: SimpleWaveformSynth },
     Sample,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Note {
     pub id: u64,
     pub pitch: u8,
@@ -282,7 +284,7 @@ pub struct Note {
     pub velocity: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: u64,
     pub source_id: u64,
@@ -290,7 +292,7 @@ pub struct Clip {
     pub length_steps: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipSource {
     pub id: u64,
     pub track_id: u64,
@@ -299,13 +301,13 @@ pub struct ClipSource {
     pub kind: ClipSourceKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClipSourceKind {
     Pattern,
     Sample { path: PathBuf },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Track {
     pub id: u64,
     pub name: String,
@@ -391,7 +393,7 @@ impl Track {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Project {
     pub bpm: f32,
     pub tracks: Vec<Track>,
