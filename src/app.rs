@@ -141,6 +141,8 @@ pub struct DawApp {
     sampler_waveform_path: Option<PathBuf>,
     sampler_waveform: Vec<[f32; 2]>,
     sampler_trim_drag: Option<TrimHandle>,
+    sampler_browser_directory: PathBuf,
+    selected_iowa_instrument: Option<PathBuf>,
 }
 
 impl DawApp {
@@ -172,6 +174,9 @@ impl DawApp {
             sampler_waveform_path: None,
             sampler_waveform: Vec::new(),
             sampler_trim_drag: None,
+            sampler_browser_directory: std::env::current_dir()
+                .expect("the DAW must start from an accessible working directory"),
+            selected_iowa_instrument: None,
         }
     }
 
@@ -1486,6 +1491,10 @@ impl DawApp {
     }
 
     fn sampler_settings(&mut self, ui: &mut egui::Ui, selected: u64) {
+        let iowa_library = downloaded_iowa_instruments();
+        if self.selected_iowa_instrument.is_none() {
+            self.selected_iowa_instrument = iowa_library.first().cloned();
+        }
         let Some(track) = self
             .project
             .tracks
@@ -1527,20 +1536,77 @@ impl DawApp {
                 .inner_margin(16.0)
                 .show(ui, |ui| {
                     ui.heading("Sample");
+                    if !iowa_library.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Downloaded Iowa library");
+                            egui::ComboBox::from_id_salt("downloaded-iowa-instrument")
+                                .selected_text(
+                                    self.selected_iowa_instrument
+                                        .as_ref()
+                                        .and_then(|path| path.file_name())
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("Select instrument"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for path in &iowa_library {
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("Unnamed instrument");
+                                        ui.selectable_value(
+                                            &mut self.selected_iowa_instrument,
+                                            Some(path.clone()),
+                                            name,
+                                        );
+                                    }
+                                });
+                            if ui.button("Load instrument").clicked()
+                                && let Some(folder) = &self.selected_iowa_instrument
+                            {
+                                match discover_iowa_regions(folder) {
+                                    Ok(regions) if !regions.is_empty() => {
+                                        sampler.path = Some(regions[0].path.clone());
+                                        sampler.root_pitch = regions[0].root_pitch;
+                                        sampler.regions = regions;
+                                        sampler.trim_start = 0.0;
+                                        sampler.trim_end = 1.0;
+                                    }
+                                    Ok(_) => {
+                                        self.audio_error = Some(format!(
+                                            "No pitch-named WAV files were found in {}",
+                                            folder.display()
+                                        ));
+                                    }
+                                    Err(error) => self.audio_error = Some(error),
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    } else {
+                        ui.weak("No downloaded Iowa instruments found in data/samples/iowa.");
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Load WAV").clicked()
                             && let Some(path) = rfd::FileDialog::new()
+                                .set_directory(&self.sampler_browser_directory)
                                 .add_filter("WAV audio", &["wav"])
                                 .pick_file()
                         {
+                            self.sampler_browser_directory = path
+                                .parent()
+                                .expect("a selected sample file has a parent directory")
+                                .to_owned();
                             sampler.path = Some(path);
                             sampler.trim_start = 0.0;
                             sampler.trim_end = 1.0;
                             sampler.regions.clear();
                         }
                         if ui.button("Import Iowa instrument").clicked()
-                            && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                            && let Some(folder) = rfd::FileDialog::new()
+                                .set_directory(&self.sampler_browser_directory)
+                                .pick_folder()
                         {
+                            self.sampler_browser_directory = folder.clone();
                             match discover_iowa_regions(&folder) {
                                 Ok(regions) if !regions.is_empty() => {
                                     sampler.path = Some(regions[0].path.clone());
@@ -1835,6 +1901,20 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
     }
     regions.sort_by_key(|region| (region.root_pitch, region.velocity_min));
     Ok(regions)
+}
+
+fn downloaded_iowa_instruments() -> Vec<PathBuf> {
+    let root = PathBuf::from("data/samples/iowa");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut instruments = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    instruments.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    instruments
 }
 
 fn parse_note_pitch(value: &str) -> Option<u8> {

@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -73,15 +74,23 @@ def instrument_pages() -> dict[str, str]:
     return pages
 
 
-def download(url: str, destination: Path) -> None:
+def download(url: str, destination: Path) -> bool:
     if destination.exists():
         print(f"Using cached {destination.name}")
-        return
+        return True
     print(f"Downloading {url}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".part")
-    temporary.write_bytes(fetch(url))
+    try:
+        temporary.write_bytes(fetch(url))
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        print(f"Skipping missing asset: {url}", file=sys.stderr)
+        temporary.unlink(missing_ok=True)
+        return False
     temporary.replace(destination)
+    return True
 
 
 def extract_archive(archive: Path, destination: Path) -> list[Path]:
@@ -191,7 +200,8 @@ def main() -> int:
         for asset_url in dict.fromkeys(asset_urls):
             filename = Path(urllib.parse.unquote(urllib.parse.urlparse(asset_url).path)).name
             cached = cache / name / filename
-            download(asset_url, cached)
+            if not download(asset_url, cached):
+                continue
             if cached.suffix.lower() == ".zip":
                 source_files.extend(extract_archive(cached, cache / name / "extracted"))
             else:
