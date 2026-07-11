@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Project;
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
@@ -50,8 +50,11 @@ mod tests {
     fn project_round_trip_preserves_editable_state() {
         let mut project = Project::default();
         project.bpm = 137.5;
-        project.tracks[0].add_note(72, 3, 5, 91);
-        project.tracks[0].ensure_pattern_clip();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 72, 3, 5, 91)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
         let path = std::env::temp_dir().join(format!(
             "donttrackme-project-round-trip-{}.dtm",
             std::process::id()
@@ -62,10 +65,24 @@ mod tests {
         std::fs::remove_file(path).expect("test project should be removable");
 
         assert_eq!(loaded.bpm, 137.5);
-        assert_eq!(loaded.tracks[0].notes.len(), 1);
-        assert_eq!(loaded.tracks[0].notes[0].velocity, 91);
+        assert_eq!(
+            loaded
+                .pattern(pattern_id)
+                .expect("pattern should load")
+                .notes
+                .len(),
+            1
+        );
+        assert_eq!(
+            loaded
+                .pattern(pattern_id)
+                .expect("pattern should load")
+                .notes[0]
+                .velocity,
+            91
+        );
         assert_eq!(loaded.tracks[0].clips.len(), 1);
-        assert_eq!(loaded.tracks[0].add_note(60, 0, 1, 100), 2);
+        assert_eq!(loaded.add_note(pattern_id, 60, 0, 1, 100), Some(2));
         assert_eq!(loaded.add_instrument(), 2);
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::model::{Note, PATTERN_STEPS, STEPS_PER_BEAT, Track};
+use crate::model::{Note, PATTERN_STEPS, Pattern, STEPS_PER_BEAT};
 
 const KEY_HEIGHT: f32 = 22.0;
 const KEYBOARD_WIDTH: f32 = 78.0;
@@ -39,7 +39,7 @@ pub struct PianoRoll {
     clipboard: Vec<Note>,
     clipboard_offset: u16,
     drag: Option<Drag>,
-    track_id: Option<u64>,
+    pattern_id: Option<u64>,
     scroll_to_middle_c: bool,
     mouse_pitch: Option<u8>,
 }
@@ -54,15 +54,15 @@ impl PianoRoll {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        track_id: u64,
-        track: &mut Track,
+        pattern_id: u64,
+        pattern: &mut Pattern,
         auditioned_notes: &HashSet<u8>,
     ) -> PianoRollOutput {
         let mut output = PianoRollOutput::default();
-        if self.track_id != Some(track_id) {
+        if self.pattern_id != Some(pattern_id) {
             self.selected.clear();
             self.drag = None;
-            self.track_id = Some(track_id);
+            self.pattern_id = Some(pattern_id);
             self.scroll_to_middle_c = true;
         }
         if ui.input(|input| input.pointer.primary_released())
@@ -71,7 +71,7 @@ impl PianoRoll {
             output.note_off = Some(pitch);
         }
 
-        self.keyboard_shortcuts(ui, track);
+        self.keyboard_shortcuts(ui, pattern);
         ui.horizontal(|ui| {
             ui.label(
                 "Drag empty space to select. Drag notes to move; drag their right edge to resize.",
@@ -117,13 +117,13 @@ impl PianoRoll {
                 output.note_on = Some(pitch);
             }
 
-            self.handle_click(ui, &response, grid, velocity, track);
-            self.begin_drag(ui, &response, grid, velocity, track);
-            self.update_drag(&response, grid, velocity, track);
-            self.paint_keyboard(&painter, rect, track, auditioned_notes);
+            self.handle_click(ui, &response, grid, velocity, pattern);
+            self.begin_drag(ui, &response, grid, velocity, pattern);
+            self.update_drag(&response, grid, velocity, pattern);
+            self.paint_keyboard(&painter, rect, pattern, auditioned_notes);
             self.paint_grid(&painter, grid);
-            self.paint_notes(&painter, grid, track);
-            self.paint_velocity(&painter, velocity, track);
+            self.paint_notes(&painter, grid, pattern);
+            self.paint_velocity(&painter, velocity, pattern);
 
             if let Some(Drag::Marquee { origin, .. }) = self.drag
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -151,18 +151,18 @@ impl PianoRoll {
         response: &egui::Response,
         grid: Rect,
         velocity: Rect,
-        track: &mut Track,
+        pattern: &mut Pattern,
     ) {
         if response.clicked_by(egui::PointerButton::Secondary) {
             if let Some(pointer) = response.interact_pointer_pos()
-                && let Some(note_id) = track
+                && let Some(note_id) = pattern
                     .notes
                     .iter()
                     .rev()
                     .find(|note| note_rect(grid, note).contains(pointer))
                     .map(|note| note.id)
             {
-                track.notes.retain(|note| note.id != note_id);
+                pattern.notes.retain(|note| note.id != note_id);
                 self.selected.remove(&note_id);
             }
             return;
@@ -175,7 +175,7 @@ impl PianoRoll {
         };
         let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
         if velocity.contains(pointer) {
-            if let Some(note) = track.notes.iter_mut().min_by(|left, right| {
+            if let Some(note) = pattern.notes.iter_mut().min_by(|left, right| {
                 let left_x = grid.left() + (f32::from(left.start_step) + 0.5) * STEP_WIDTH;
                 let right_x = grid.left() + (f32::from(right.start_step) + 0.5) * STEP_WIDTH;
                 (left_x - pointer.x)
@@ -190,7 +190,7 @@ impl PianoRoll {
             }
             return;
         }
-        if let Some(note_id) = track
+        if let Some(note_id) = pattern
             .notes
             .iter()
             .rev()
@@ -209,14 +209,13 @@ impl PianoRoll {
             let step = ((pointer.x - grid.left()) / STEP_WIDTH).floor() as u16;
             let row = ((pointer.y - grid.top()) / KEY_HEIGHT).floor() as u8;
             let pitch = LOWEST_PITCH + PITCH_COUNT - 1 - row;
-            let id = track.add_note(pitch, step, 1, 100);
-            track.ensure_pattern_clip();
+            let id = pattern.add_note(pitch, step, 1, 100);
             self.selected.clear();
             self.selected.insert(id);
         }
     }
 
-    fn keyboard_shortcuts(&mut self, ui: &mut egui::Ui, track: &mut Track) {
+    fn keyboard_shortcuts(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         let (copy, cut, paste, delete) = ui.input(|input| {
             (
                 input.modifiers.command && input.key_pressed(egui::Key::C),
@@ -226,7 +225,7 @@ impl PianoRoll {
             )
         });
         if copy || cut {
-            self.clipboard = track
+            self.clipboard = pattern
                 .notes
                 .iter()
                 .filter(|note| self.selected.contains(&note.id))
@@ -235,20 +234,22 @@ impl PianoRoll {
             self.clipboard_offset = STEPS_PER_BEAT;
         }
         if cut || delete {
-            track.notes.retain(|note| !self.selected.contains(&note.id));
+            pattern
+                .notes
+                .retain(|note| !self.selected.contains(&note.id));
             self.selected.clear();
         }
         if paste && !self.clipboard.is_empty() {
-            self.paste_clipboard(track);
+            self.paste_clipboard(pattern);
         }
     }
 
-    fn paste_clipboard(&mut self, track: &mut Track) {
+    fn paste_clipboard(&mut self, pattern: &mut Pattern) {
         self.selected.clear();
         for note in &self.clipboard {
             let start = note.start_step.saturating_add(self.clipboard_offset);
             if start < STEPS {
-                let id = track.add_note(
+                let id = pattern.add_note(
                     note.pitch,
                     start,
                     note.length_steps.min(STEPS - start),
@@ -258,7 +259,6 @@ impl PianoRoll {
             }
         }
         self.clipboard_offset = self.clipboard_offset.saturating_add(STEPS_PER_BEAT);
-        track.ensure_pattern_clip();
     }
 
     fn begin_drag(
@@ -267,7 +267,7 @@ impl PianoRoll {
         response: &egui::Response,
         grid: Rect,
         velocity: Rect,
-        track: &Track,
+        pattern: &Pattern,
     ) {
         if !response.drag_started() {
             return;
@@ -278,7 +278,7 @@ impl PianoRoll {
         let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
 
         if velocity.contains(pointer)
-            && let Some(note) = track.notes.iter().min_by(|left, right| {
+            && let Some(note) = pattern.notes.iter().min_by(|left, right| {
                 let left_x = grid.left() + (f32::from(left.start_step) + 0.5) * STEP_WIDTH;
                 let right_x = grid.left() + (f32::from(right.start_step) + 0.5) * STEP_WIDTH;
                 (left_x - pointer.x)
@@ -294,7 +294,7 @@ impl PianoRoll {
             return;
         }
 
-        if let Some(note) = track
+        if let Some(note) = pattern
             .notes
             .iter()
             .rev()
@@ -319,7 +319,7 @@ impl PianoRoll {
             } else {
                 self.drag = Some(Drag::Move {
                     origin: pointer,
-                    notes: track
+                    notes: pattern
                         .notes
                         .iter()
                         .filter(|note| self.selected.contains(&note.id))
@@ -343,7 +343,7 @@ impl PianoRoll {
         response: &egui::Response,
         grid: Rect,
         velocity: Rect,
-        track: &mut Track,
+        pattern: &mut Pattern,
     ) {
         let Some(pointer) = response.interact_pointer_pos() else {
             return;
@@ -352,7 +352,7 @@ impl PianoRoll {
             Some(Drag::Move { origin, notes }) => {
                 let step_delta = ((pointer.x - origin.x) / STEP_WIDTH).round() as i32;
                 let pitch_delta = -((pointer.y - origin.y) / KEY_HEIGHT).round() as i32;
-                for note in &mut track.notes {
+                for note in &mut pattern.notes {
                     if let Some((_, pitch, start)) = notes.iter().find(|(id, _, _)| *id == note.id)
                     {
                         note.start_step = (i32::from(*start) + step_delta)
@@ -370,7 +370,7 @@ impl PianoRoll {
                 note_id,
                 original_length,
             }) => {
-                if let Some(note) = track.notes.iter_mut().find(|note| note.id == *note_id) {
+                if let Some(note) = pattern.notes.iter_mut().find(|note| note.id == *note_id) {
                     let delta = ((pointer.x - origin_x) / STEP_WIDTH).round() as i32;
                     note.length_steps = (i32::from(*original_length) + delta)
                         .clamp(1, i32::from(STEPS - note.start_step))
@@ -383,7 +383,7 @@ impl PianoRoll {
                 }
                 let selection = Rect::from_two_pos(*origin, pointer).intersect(grid);
                 self.selected.extend(
-                    track
+                    pattern
                         .notes
                         .iter()
                         .filter(|note| selection.intersects(note_rect(grid, note)))
@@ -394,7 +394,7 @@ impl PianoRoll {
                 let value = (((velocity.bottom() - pointer.y) / velocity.height()) * 127.0)
                     .round()
                     .clamp(1.0, 127.0) as u8;
-                if let Some(note) = track.notes.iter_mut().find(|note| note.id == *note_id) {
+                if let Some(note) = pattern.notes.iter_mut().find(|note| note.id == *note_id) {
                     note.velocity = value;
                 }
             }
@@ -406,10 +406,10 @@ impl PianoRoll {
         &self,
         painter: &egui::Painter,
         rect: Rect,
-        track: &Track,
+        pattern: &Pattern,
         auditioned_notes: &HashSet<u8>,
     ) {
-        let selected_pitches = track
+        let selected_pitches = pattern
             .notes
             .iter()
             .filter(|note| self.selected.contains(&note.id))
@@ -473,8 +473,8 @@ impl PianoRoll {
         }
     }
 
-    fn paint_notes(&self, painter: &egui::Painter, grid: Rect, track: &Track) {
-        for note in &track.notes {
+    fn paint_notes(&self, painter: &egui::Painter, grid: Rect, pattern: &Pattern) {
+        for note in &pattern.notes {
             let rect = note_rect(grid, note);
             let selected = self.selected.contains(&note.id);
             painter.rect_filled(
@@ -503,7 +503,7 @@ impl PianoRoll {
         }
     }
 
-    fn paint_velocity(&self, painter: &egui::Painter, velocity: Rect, track: &Track) {
+    fn paint_velocity(&self, painter: &egui::Painter, velocity: Rect, pattern: &Pattern) {
         painter.text(
             Pos2::new(velocity.left() - 8.0, velocity.top()),
             egui::Align2::RIGHT_TOP,
@@ -516,7 +516,7 @@ impl PianoRoll {
             [velocity.left_top(), velocity.right_top()],
             Stroke::new(1.0, Color32::from_gray(75)),
         );
-        for note in &track.notes {
+        for note in &pattern.notes {
             let x = velocity.left() + (f32::from(note.start_step) + 0.5) * STEP_WIDTH;
             let top = velocity.bottom() - velocity.height() * f32::from(note.velocity) / 127.0;
             let color = if self.selected.contains(&note.id) {
@@ -557,7 +557,7 @@ fn note_name(pitch: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PianoRoll, STEPS_PER_BEAT, note_name};
-    use crate::model::{Note, Track};
+    use crate::model::{Note, Pattern};
 
     #[test]
     fn extended_keyboard_uses_requested_octave_bounds() {
@@ -579,12 +579,12 @@ mod tests {
             clipboard_offset: STEPS_PER_BEAT,
             ..PianoRoll::default()
         };
-        let mut track = Track::instrument(1, 1, "Synth".to_owned());
+        let mut pattern = Pattern::default();
 
-        piano_roll.paste_clipboard(&mut track);
-        piano_roll.paste_clipboard(&mut track);
+        piano_roll.paste_clipboard(&mut pattern);
+        piano_roll.paste_clipboard(&mut pattern);
 
-        assert_eq!(track.notes[0].start_step, 3 + STEPS_PER_BEAT);
-        assert_eq!(track.notes[1].start_step, 3 + STEPS_PER_BEAT * 2);
+        assert_eq!(pattern.notes[0].start_step, 3 + STEPS_PER_BEAT);
+        assert_eq!(pattern.notes[1].start_step, 3 + STEPS_PER_BEAT * 2);
     }
 }

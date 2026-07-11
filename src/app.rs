@@ -376,17 +376,48 @@ impl DawApp {
 
                 ui.add_space(12.0);
                 ui.separator();
-                ui.heading("Clip library");
+                ui.horizontal(|ui| {
+                    ui.heading("Clip library");
+                    if ui.button("+ Pattern").clicked()
+                        && let Some(channel_id) = self.selected_track
+                        && self.project.tracks.iter().any(|track| {
+                            track.id == channel_id
+                                && matches!(track.kind, TrackKind::Instrument { .. })
+                        })
+                    {
+                        let source_id = self.project.add_pattern(channel_id);
+                        if let Some(track) = self
+                            .project
+                            .tracks
+                            .iter_mut()
+                            .find(|track| track.id == channel_id)
+                        {
+                            let start = track
+                                .clips
+                                .iter()
+                                .map(|clip| clip.start_step + clip.length_steps)
+                                .max()
+                                .unwrap_or(0)
+                                .min(ARRANGEMENT_STEPS - 1);
+                            let id = track.add_clip(
+                                source_id,
+                                start,
+                                PATTERN_STEPS.min(ARRANGEMENT_STEPS - start),
+                            );
+                            self.selected_clip = Some((channel_id, id));
+                        }
+                    }
+                });
                 ui.weak("Reusable originals");
                 let mut add_source = None;
                 for source in &self.project.clip_library {
                     ui.horizontal(|ui| {
                         ui.label(match &source.kind {
-                            ClipSourceKind::Pattern => "▦",
+                            ClipSourceKind::Pattern { .. } => "▦",
                             ClipSourceKind::Sample { .. } => "▰",
                         });
                         let details = match &source.kind {
-                            ClipSourceKind::Pattern => {
+                            ClipSourceKind::Pattern { .. } => {
                                 format!("Original length: {} steps", source.length_steps)
                             }
                             ClipSourceKind::Sample { path } => format!(
@@ -401,31 +432,30 @@ impl DawApp {
                             .on_hover_text("Add to arrangement")
                             .clicked()
                         {
-                            add_source = Some((source.track_id, source.id, source.length_steps));
+                            add_source = Some((source.channel_id, source.id, source.length_steps));
                         }
                     });
                 }
-                if let Some((track_id, source_id, length)) = add_source
-                    && let Some(track) = self
+                if let Some((channel_id, source_id, length)) = add_source {
+                    let track_id = self.selected_track.unwrap_or(channel_id);
+                    if let Some(track) = self
                         .project
                         .tracks
                         .iter_mut()
                         .find(|track| track.id == track_id)
-                {
-                    let start = track
-                        .clips
-                        .iter()
-                        .map(|clip| clip.start_step + clip.length_steps)
-                        .max()
-                        .unwrap_or(0);
-                    let start = start.min(ARRANGEMENT_STEPS - 1);
-                    let id = track.add_clip(start, length.min(ARRANGEMENT_STEPS - start));
-                    debug_assert_eq!(
-                        track.clips.last().map(|clip| clip.source_id),
-                        Some(source_id)
-                    );
-                    self.selected_clip = Some((track_id, id));
-                    self.view = View::Arrangement;
+                    {
+                        let start = track
+                            .clips
+                            .iter()
+                            .map(|clip| clip.start_step + clip.length_steps)
+                            .max()
+                            .unwrap_or(0);
+                        let start = start.min(ARRANGEMENT_STEPS - 1);
+                        let id =
+                            track.add_clip(source_id, start, length.min(ARRANGEMENT_STEPS - start));
+                        self.selected_clip = Some((track_id, id));
+                        self.view = View::Arrangement;
+                    }
                 }
             });
     }
@@ -474,16 +504,18 @@ impl DawApp {
                 && let Some(clip) = track.clips.iter().find(|clip| clip.id == clip_id).cloned()
             {
                 let start = (clip.start_step + clip.length_steps).min(STEPS - 1);
-                let id = track.add_clip(start, clip.length_steps.min(STEPS - start));
+                let id =
+                    track.add_clip(clip.source_id, start, clip.length_steps.min(STEPS - start));
                 self.selected_clip = Some((track_id, id));
             }
         }
         if paste
             && let Some(copied) = self.clip_clipboard.clone()
-            && let Some(track_id) = self
-                .project
-                .source(copied.source_id)
-                .map(|source| source.track_id)
+            && let Some(track_id) = self.selected_track.or_else(|| {
+                self.project
+                    .source(copied.source_id)
+                    .map(|source| source.channel_id)
+            })
             && let Some(track) = self
                 .project
                 .tracks
@@ -491,7 +523,11 @@ impl DawApp {
                 .find(|track| track.id == track_id)
         {
             let start = (copied.start_step + copied.length_steps).min(STEPS - 1);
-            let id = track.add_clip(start, copied.length_steps.min(STEPS - start));
+            let id = track.add_clip(
+                copied.source_id,
+                start,
+                copied.length_steps.min(STEPS - start),
+            );
             let pasted = track
                 .clips
                 .last_mut()
@@ -521,6 +557,8 @@ impl DawApp {
         ui.add_space(8.0);
 
         let clip_library = self.project.clip_library.clone();
+        let mut lane_rects = Vec::new();
+        let mut clip_drop = None;
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.set_min_width(180.0 + STEP_WIDTH * f32::from(STEPS));
             ui.horizontal(|ui| {
@@ -556,7 +594,11 @@ impl DawApp {
                                 .max()
                                 .unwrap_or(0);
                             if start < STEPS {
-                                let id = track.add_clip(start, PATTERN_STEPS.min(STEPS - start));
+                                let id = track.add_clip(
+                                    track.source_id,
+                                    start,
+                                    PATTERN_STEPS.min(STEPS - start),
+                                );
                                 self.selected_clip = Some((track.id, id));
                             }
                         }
@@ -565,6 +607,7 @@ impl DawApp {
                         egui::vec2(STEP_WIDTH * f32::from(STEPS), TRACK_HEIGHT),
                         egui::Sense::click_and_drag(),
                     );
+                    lane_rects.push((track.id, rect));
                     ui.painter()
                         .rect_filled(rect, 3.0, Color32::from_rgb(31, 35, 42));
                     for step in 0..=STEPS {
@@ -604,15 +647,26 @@ impl DawApp {
                                 clip_rect(clip.start_step, clip.length_steps).contains(pointer)
                             })
                             .map(|clip| (track.id, clip.id));
+                        self.selected_track = Some(track.id);
                     }
                     if response.double_clicked()
                         && let Some(pointer) = response.interact_pointer_pos()
-                        && matches!(track.kind, TrackKind::Instrument { .. })
                         && track.clips.iter().any(|clip| {
                             clip_rect(clip.start_step, clip.length_steps).contains(pointer)
                         })
                     {
-                        self.selected_track = Some(track.id);
+                        let source_id = track
+                            .clips
+                            .iter()
+                            .find(|clip| {
+                                clip_rect(clip.start_step, clip.length_steps).contains(pointer)
+                            })
+                            .map(|clip| clip.source_id)
+                            .expect("double-clicked clip was just found");
+                        self.selected_track = clip_library
+                            .iter()
+                            .find(|source| source.id == source_id)
+                            .map(|source| source.channel_id);
                         self.view = View::PianoRoll;
                     }
                     if response.drag_started()
@@ -677,6 +731,14 @@ impl DawApp {
                         }
                     }
                     if response.drag_stopped() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            clip_drop = match &self.clip_drag {
+                                Some(ClipDrag::Move {
+                                    track_id, clip_id, ..
+                                }) => Some((*track_id, *clip_id, pointer)),
+                                Some(ClipDrag::Resize { .. }) | None => None,
+                            };
+                        }
                         self.clip_drag = None;
                     }
 
@@ -715,11 +777,9 @@ impl DawApp {
                             egui::FontId::proportional(12.0),
                             Color32::WHITE,
                         );
-                        if matches!(track.kind, TrackKind::Instrument { .. })
-                            && !track.notes.is_empty()
-                        {
+                        if let ClipSourceKind::Pattern { pattern } = &source.kind {
                             let baseline = area.bottom() - 6.0;
-                            for note in &track.notes {
+                            for note in &pattern.notes {
                                 let x = area.left() + f32::from(note.start_step) * STEP_WIDTH;
                                 if x < area.right() - 3.0 {
                                     let y =
@@ -739,6 +799,32 @@ impl DawApp {
                 ui.add_space(4.0);
             }
         });
+        if let Some((from_track_id, clip_id, pointer)) = clip_drop
+            && let Some(to_track_id) = lane_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pointer))
+                .map(|(track_id, _)| *track_id)
+            && to_track_id != from_track_id
+            && let Some(from_index) = self
+                .project
+                .tracks
+                .iter()
+                .position(|track| track.id == from_track_id)
+            && let Some(clip_index) = self.project.tracks[from_index]
+                .clips
+                .iter()
+                .position(|clip| clip.id == clip_id)
+        {
+            let clip = self.project.tracks[from_index].clips.remove(clip_index);
+            let to_track = self
+                .project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == to_track_id)
+                .expect("drop target lane was just found");
+            let new_id = to_track.add_clip(clip.source_id, clip.start_step, clip.length_steps);
+            self.selected_clip = Some((to_track_id, new_id));
+        }
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
@@ -755,7 +841,28 @@ impl DawApp {
             ui.centered_and_justified(|ui| ui.label("Select a track to edit it."));
             return;
         };
-        let track = &mut self.project.tracks[index];
+        let pattern_id = self
+            .selected_clip
+            .and_then(|(lane_id, clip_id)| {
+                self.project
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == lane_id)
+                    .and_then(|track| track.clips.iter().find(|clip| clip.id == clip_id))
+                    .map(|clip| clip.source_id)
+            })
+            .unwrap_or(self.project.tracks[index].source_id);
+        let Some(source_index) = self
+            .project
+            .clip_library
+            .iter()
+            .position(|source| source.id == pattern_id)
+        else {
+            ui.label("This pattern is no longer in the clip library.");
+            return;
+        };
+        let (tracks, sources) = (&mut self.project.tracks, &mut self.project.clip_library);
+        let track = &mut tracks[index];
 
         ui.horizontal(|ui| {
             ui.heading(&track.name);
@@ -779,10 +886,14 @@ impl DawApp {
             }
         });
         ui.separator();
-        if let TrackKind::Instrument { synth } = track.kind {
+        let pattern_name = sources[source_index].name.clone();
+        if let TrackKind::Instrument { synth } = track.kind
+            && let ClipSourceKind::Pattern { pattern } = &mut sources[source_index].kind
+        {
+            ui.label(format!("Editing {pattern_name}"));
             let output = self
                 .piano_roll
-                .show(ui, selected, track, &self.auditioned_notes);
+                .show(ui, pattern_id, pattern, &self.auditioned_notes);
             if let Some(audio) = &self.audio {
                 if let Some(pitch) = output.note_off
                     && let Err(error) = audio.audition_stop(pitch)
@@ -796,7 +907,7 @@ impl DawApp {
                 }
             }
         } else {
-            ui.label("Sample tracks do not have a piano roll.");
+            ui.label("Select an instrument pattern to open its piano roll.");
         }
     }
 

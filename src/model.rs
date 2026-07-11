@@ -436,7 +436,7 @@ pub struct Clip {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipSource {
     pub id: u64,
-    pub track_id: u64,
+    pub channel_id: u64,
     pub name: String,
     pub length_steps: u16,
     pub kind: ClipSourceKind,
@@ -444,8 +444,38 @@ pub struct ClipSource {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClipSourceKind {
-    Pattern,
+    Pattern { pattern: Pattern },
     Sample { path: PathBuf },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pattern {
+    pub notes: Vec<Note>,
+    next_note_id: u64,
+}
+
+impl Pattern {
+    pub fn add_note(&mut self, pitch: u8, start_step: u16, length_steps: u16, velocity: u8) -> u64 {
+        let id = self.next_note_id;
+        self.next_note_id += 1;
+        self.notes.push(Note {
+            id,
+            pitch,
+            start_step,
+            length_steps,
+            velocity,
+        });
+        id
+    }
+}
+
+impl Default for Pattern {
+    fn default() -> Self {
+        Self {
+            notes: Vec::new(),
+            next_note_id: 1,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -454,11 +484,9 @@ pub struct Track {
     pub name: String,
     pub kind: TrackKind,
     pub source_id: u64,
-    pub notes: Vec<Note>,
     pub clips: Vec<Clip>,
     pub muted: bool,
     pub solo: bool,
-    next_note_id: u64,
     next_clip_id: u64,
 }
 
@@ -471,11 +499,9 @@ impl Track {
                 synth: SimpleWaveformSynth::default(),
             },
             source_id,
-            notes: Vec::new(),
             clips: Vec::new(),
             muted: false,
             solo: false,
-            next_note_id: 1,
             next_clip_id: 1,
         }
     }
@@ -491,46 +517,25 @@ impl Track {
             name,
             kind: TrackKind::Sample,
             source_id,
-            notes: Vec::new(),
             clips: Vec::new(),
             muted: false,
             solo: false,
-            next_note_id: 1,
             next_clip_id: 1,
         };
-        track.add_clip(0, 16);
+        track.add_clip(source_id, 0, 16);
         track
     }
 
-    pub fn add_note(&mut self, pitch: u8, start_step: u16, length_steps: u16, velocity: u8) -> u64 {
-        let id = self.next_note_id;
-        self.next_note_id += 1;
-        self.notes.push(Note {
-            id,
-            pitch,
-            start_step,
-            length_steps,
-            velocity,
-        });
-        id
-    }
-
-    pub fn add_clip(&mut self, start_step: u16, length_steps: u16) -> u64 {
+    pub fn add_clip(&mut self, source_id: u64, start_step: u16, length_steps: u16) -> u64 {
         let id = self.next_clip_id;
         self.next_clip_id += 1;
         self.clips.push(Clip {
             id,
-            source_id: self.source_id,
+            source_id,
             start_step,
             length_steps,
         });
         id
-    }
-
-    pub fn ensure_pattern_clip(&mut self) {
-        if self.clips.is_empty() {
-            self.add_clip(0, PATTERN_STEPS);
-        }
     }
 }
 
@@ -572,10 +577,12 @@ impl Project {
         let name = format!("Simple waveform {number}");
         self.clip_library.push(ClipSource {
             id: source_id,
-            track_id: id,
+            channel_id: id,
             name: format!("Pattern {number}"),
             length_steps: PATTERN_STEPS,
-            kind: ClipSourceKind::Pattern,
+            kind: ClipSourceKind::Pattern {
+                pattern: Pattern::default(),
+            },
         });
         self.tracks.push(Track::instrument(id, source_id, name));
         id
@@ -593,7 +600,7 @@ impl Project {
             .to_owned();
         self.clip_library.push(ClipSource {
             id: source_id,
-            track_id: id,
+            channel_id: id,
             name,
             length_steps: 16,
             kind: ClipSourceKind::Sample { path: path.clone() },
@@ -605,11 +612,73 @@ impl Project {
     pub fn source(&self, id: u64) -> Option<&ClipSource> {
         self.clip_library.iter().find(|source| source.id == id)
     }
+
+    #[cfg(test)]
+    pub fn source_mut(&mut self, id: u64) -> Option<&mut ClipSource> {
+        self.clip_library.iter_mut().find(|source| source.id == id)
+    }
+
+    pub fn add_pattern(&mut self, channel_id: u64) -> u64 {
+        let id = self.next_source_id;
+        self.next_source_id += 1;
+        let number = self
+            .clip_library
+            .iter()
+            .filter(|source| matches!(source.kind, ClipSourceKind::Pattern { .. }))
+            .count()
+            + 1;
+        self.clip_library.push(ClipSource {
+            id,
+            channel_id,
+            name: format!("Pattern {number}"),
+            length_steps: PATTERN_STEPS,
+            kind: ClipSourceKind::Pattern {
+                pattern: Pattern::default(),
+            },
+        });
+        id
+    }
+
+    #[cfg(test)]
+    pub fn add_note(
+        &mut self,
+        pattern_id: u64,
+        pitch: u8,
+        start_step: u16,
+        length_steps: u16,
+        velocity: u8,
+    ) -> Option<u64> {
+        let source = self.source_mut(pattern_id)?;
+        let ClipSourceKind::Pattern { pattern } = &mut source.kind else {
+            return None;
+        };
+        Some(pattern.add_note(pitch, start_step, length_steps, velocity))
+    }
+
+    pub fn pattern(&self, pattern_id: u64) -> Option<&Pattern> {
+        let source = self.source(pattern_id)?;
+        let ClipSourceKind::Pattern { pattern } = &source.kind else {
+            return None;
+        };
+        Some(pattern)
+    }
+
+    #[cfg(test)]
+    pub fn ensure_primary_pattern_clip(&mut self, channel_id: u64) {
+        if let Some(track) = self.tracks.iter_mut().find(|track| track.id == channel_id)
+            && !track
+                .clips
+                .iter()
+                .any(|clip| clip.source_id == track.source_id)
+        {
+            track.add_clip(track.source_id, 0, PATTERN_STEPS);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PATTERN_STEPS, Project, SimpleWaveformSynth, Track, Waveform, noise_sample};
+    use super::{PATTERN_STEPS, Pattern, Project, SimpleWaveformSynth, Waveform, noise_sample};
 
     #[test]
     fn synth_defaults_to_one_layer_and_presets_respect_the_four_layer_cap() {
@@ -658,43 +727,76 @@ mod tests {
     /// Note identities remain distinct so selection survives moving and resizing notes.
     #[test]
     fn notes_receive_stable_unique_ids() {
-        let mut track = Track::instrument(1, 1, "Synth".to_owned());
+        let mut pattern = Pattern::default();
 
-        let first = track.add_note(60, 0, 1, 100);
-        let second = track.add_note(64, 4, 2, 90);
-        track.notes[0].start_step = 8;
+        let first = pattern.add_note(60, 0, 1, 100);
+        let second = pattern.add_note(64, 4, 2, 90);
+        pattern.notes[0].start_step = 8;
 
         assert_ne!(first, second);
-        assert_eq!(track.notes[0].id, first);
-        assert_eq!(track.notes[0].start_step, 8);
+        assert_eq!(pattern.notes[0].id, first);
+        assert_eq!(pattern.notes[0].start_step, 8);
     }
 
     /// Adding more notes reuses the existing pattern clip instead of obscuring it with duplicates.
     #[test]
     fn pattern_clip_is_created_once() {
-        let mut track = Track::instrument(1, 1, "Synth".to_owned());
+        let mut project = Project::default();
+        let channel_id = project.tracks[0].id;
 
-        track.ensure_pattern_clip();
-        track.ensure_pattern_clip();
+        project.ensure_primary_pattern_clip(channel_id);
+        project.ensure_primary_pattern_clip(channel_id);
 
-        assert_eq!(track.clips.len(), 1);
-        assert_eq!(track.clips[0].start_step, 0);
-        assert_eq!(track.clips[0].length_steps, PATTERN_STEPS);
+        assert_eq!(project.tracks[0].clips.len(), 1);
+        assert_eq!(project.tracks[0].clips[0].start_step, 0);
+        assert_eq!(project.tracks[0].clips[0].length_steps, PATTERN_STEPS);
     }
 
     /// Trimming an arrangement instance never changes its reusable library source.
     #[test]
     fn trimming_clip_preserves_source_length() {
         let mut project = Project::default();
-        let track = &mut project.tracks[0];
-        track.ensure_pattern_clip();
-        let source_id = track.clips[0].source_id;
-        track.clips[0].length_steps = 8;
+        let channel_id = project.tracks[0].id;
+        project.ensure_primary_pattern_clip(channel_id);
+        let source_id = project.tracks[0].clips[0].source_id;
+        project.tracks[0].clips[0].length_steps = 8;
 
         assert_eq!(
             project.source(source_id).map(|source| source.length_steps),
             Some(PATTERN_STEPS)
         );
         assert_eq!(project.tracks[0].clips[0].length_steps, 8);
+    }
+
+    #[test]
+    fn patterns_on_one_instrument_have_independent_notes() {
+        let mut project = Project::default();
+        let channel_id = project.tracks[0].id;
+        let first = project.tracks[0].source_id;
+        let second = project.add_pattern(channel_id);
+
+        project
+            .add_note(first, 60, 0, 2, 100)
+            .expect("first pattern should exist");
+        project
+            .add_note(second, 72, 4, 1, 90)
+            .expect("second pattern should exist");
+
+        assert_eq!(
+            project
+                .pattern(first)
+                .expect("first pattern should exist")
+                .notes[0]
+                .pitch,
+            60
+        );
+        assert_eq!(
+            project
+                .pattern(second)
+                .expect("second pattern should exist")
+                .notes[0]
+                .pitch,
+            72
+        );
     }
 }

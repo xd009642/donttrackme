@@ -154,52 +154,64 @@ impl PlaybackPlan {
         let any_solo = project.tracks.iter().any(|track| track.solo);
         let mut voices = Vec::new();
 
-        for track in &project.tracks {
-            if track.muted || (any_solo && !track.solo) {
+        for channel in &project.tracks {
+            if channel.muted || (any_solo && !channel.solo) {
                 continue;
             }
-            let TrackKind::Instrument { synth } = track.kind else {
+            let TrackKind::Instrument { synth } = channel.kind else {
                 continue;
             };
-            let mut track_voices = Vec::new();
-            for clip in &track.clips {
-                for note in &track.notes {
-                    if note.start_step >= clip.length_steps {
+            let mut channel_voices = Vec::new();
+            for lane in project.tracks.iter().filter(|lane| !lane.muted) {
+                for clip in &lane.clips {
+                    let Some(source) = project.source(clip.source_id) else {
+                        continue;
+                    };
+                    if source.channel_id != channel.id {
                         continue;
                     }
-                    let start_step = clip.start_step + note.start_step;
-                    if start_step >= ARRANGEMENT_STEPS {
+                    let Some(pattern) = project.pattern(source.id) else {
                         continue;
+                    };
+                    for note in &pattern.notes {
+                        if note.start_step >= clip.length_steps {
+                            continue;
+                        }
+                        let start_step = clip.start_step + note.start_step;
+                        if start_step >= ARRANGEMENT_STEPS {
+                            continue;
+                        }
+                        let end_step = clip.start_step
+                            + (note.start_step + note.length_steps).min(clip.length_steps);
+                        let frequency = pitch_frequency(note.pitch, synth.pitch_shift);
+                        channel_voices.push(Voice {
+                            start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
+                            note_off_sample: (f32::from(end_step) * samples_per_step).round()
+                                as u64,
+                            frequency,
+                            glide_from_frequency: frequency,
+                            gain: f32::from(note.velocity) / 127.0,
+                            synth,
+                            filter: FilterState::default(),
+                        });
                     }
-                    let end_step = clip.start_step
-                        + (note.start_step + note.length_steps).min(clip.length_steps);
-                    let frequency = pitch_frequency(note.pitch, synth.pitch_shift);
-                    track_voices.push(Voice {
-                        start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
-                        note_off_sample: (f32::from(end_step) * samples_per_step).round() as u64,
-                        frequency,
-                        glide_from_frequency: frequency,
-                        gain: f32::from(note.velocity) / 127.0,
-                        synth,
-                        filter: FilterState::default(),
-                    });
                 }
             }
-            track_voices.sort_by_key(|voice| voice.start_sample);
+            channel_voices.sort_by_key(|voice| voice.start_sample);
             if synth.mono {
-                for index in 0..track_voices.len() {
+                for index in 0..channel_voices.len() {
                     if index > 0 {
-                        track_voices[index].glide_from_frequency =
-                            track_voices[index - 1].frequency;
+                        channel_voices[index].glide_from_frequency =
+                            channel_voices[index - 1].frequency;
                     }
-                    if index + 1 < track_voices.len() {
-                        track_voices[index].note_off_sample = track_voices[index]
+                    if index + 1 < channel_voices.len() {
+                        channel_voices[index].note_off_sample = channel_voices[index]
                             .note_off_sample
-                            .min(track_voices[index + 1].start_sample);
+                            .min(channel_voices[index + 1].start_sample);
                     }
                 }
             }
-            voices.extend(track_voices);
+            voices.extend(channel_voices);
         }
 
         Self {
@@ -515,11 +527,13 @@ mod tests {
     fn playback_plan_places_and_trims_notes_with_the_clip() {
         let mut project = Project::default();
         project.bpm = 60.0;
-        let track = &mut project.tracks[0];
-        track.add_note(69, 2, 4, 127);
-        track.ensure_pattern_clip();
-        track.clips[0].start_step = 4;
-        track.clips[0].length_steps = 3;
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 69, 2, 4, 127)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
+        project.tracks[0].clips[0].start_step = 4;
+        project.tracks[0].clips[0].length_steps = 3;
 
         let plan = PlaybackPlan::from_project(&project, 100.0);
 
@@ -532,10 +546,12 @@ mod tests {
     #[test]
     fn muted_tracks_are_not_scheduled() {
         let mut project = Project::default();
-        let track = &mut project.tracks[0];
-        track.add_note(60, 0, 1, 100);
-        track.ensure_pattern_clip();
-        track.muted = true;
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 60, 0, 1, 100)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
+        project.tracks[0].muted = true;
 
         assert!(
             PlaybackPlan::from_project(&project, 48_000.0)
@@ -588,9 +604,15 @@ mod tests {
             panic!("the default track is an instrument");
         };
         synth.mono = true;
-        track.add_note(60, 0, 8, 100);
-        track.add_note(72, 4, 4, 100);
-        track.ensure_pattern_clip();
+        let channel_id = track.id;
+        let pattern_id = track.source_id;
+        project
+            .add_note(pattern_id, 60, 0, 8, 100)
+            .expect("primary pattern should exist");
+        project
+            .add_note(pattern_id, 72, 4, 4, 100)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(channel_id);
 
         let plan = PlaybackPlan::from_project(&project, 48_000.0);
 
@@ -606,8 +628,11 @@ mod tests {
     fn wav_export_writes_stereo_pcm_audio() {
         let mut project = Project::default();
         project.bpm = 300.0;
-        project.tracks[0].add_note(69, 0, 4, 127);
-        project.tracks[0].ensure_pattern_clip();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 69, 0, 4, 127)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
         let path =
             std::env::temp_dir().join(format!("donttrackme-wav-export-{}.wav", std::process::id()));
 
@@ -621,5 +646,26 @@ mod tests {
         assert_eq!(specification.sample_rate, 44_100);
         assert_eq!(specification.bits_per_sample, 16);
         assert!(duration > 0);
+    }
+
+    #[test]
+    fn pattern_plays_from_its_channel_when_placed_on_another_lane() {
+        let mut project = Project::default();
+        let source_id = project.tracks[0].source_id;
+        project
+            .add_note(source_id, 69, 0, 2, 127)
+            .expect("primary pattern should exist");
+        let other_lane = project.add_instrument();
+        project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == other_lane)
+            .expect("new lane should exist")
+            .add_clip(source_id, 0, 8);
+
+        let plan = PlaybackPlan::from_project(&project, 48_000.0);
+
+        assert_eq!(plan.voices.len(), 1);
+        assert!((plan.voices[0].frequency - 440.0).abs() < f32::EPSILON);
     }
 }
