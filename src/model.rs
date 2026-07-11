@@ -148,6 +148,42 @@ macro_rules! preset {
     }};
 }
 
+const fn snare_preset() -> SynthPreset {
+    let mut preset = preset!(
+        "Snare drum",
+        "Percussion",
+        Waveform::Noise,
+        3,
+        0.0,
+        0.7,
+        0.0,
+        120.0,
+        0.0,
+        80.0,
+        -5,
+        FilterKind::LowPass,
+        7_500.0,
+    );
+    preset.synth.master_level = 0.9;
+    preset.synth.filter_resonance = 0.05;
+    preset.synth.layers[0] = OscillatorLayer {
+        waveform: Waveform::Sine,
+        level: 0.8,
+        detune_cents: 0.0,
+    };
+    preset.synth.layers[1] = OscillatorLayer {
+        waveform: Waveform::Noise,
+        level: 0.75,
+        detune_cents: 0.0,
+    };
+    preset.synth.layers[2] = OscillatorLayer {
+        waveform: Waveform::Square,
+        level: 0.16,
+        detune_cents: 7.0,
+    };
+    preset
+}
+
 impl SimpleWaveformSynth {
     pub const PRESETS: [SynthPreset; 14] = [
         preset!(
@@ -221,20 +257,7 @@ impl SimpleWaveformSynth {
             FilterKind::LowPass,
             2_500.0,
         ),
-        preset!(
-            "Snare drum",
-            "Percussion",
-            Waveform::Noise,
-            2,
-            9.0,
-            0.7,
-            0.0,
-            95.0,
-            0.0,
-            140.0,
-            FilterKind::BandPass,
-            2_400.0,
-        ),
+        snare_preset(),
         preset!(
             "Closed hi-hat",
             "Percussion",
@@ -376,6 +399,15 @@ impl Waveform {
             Self::Noise => noise_sample,
         }
     }
+}
+
+pub fn noise_sample(mut seed: u32) -> f32 {
+    seed ^= seed >> 16;
+    seed = seed.wrapping_mul(0x7feb_352d);
+    seed ^= seed >> 15;
+    seed = seed.wrapping_mul(0x846c_a68b);
+    seed ^= seed >> 16;
+    seed as f32 / u32::MAX as f32 * 2.0 - 1.0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -577,7 +609,7 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{PATTERN_STEPS, Project, SimpleWaveformSynth, Track, Waveform};
+    use super::{PATTERN_STEPS, Project, SimpleWaveformSynth, Track, Waveform, noise_sample};
 
     #[test]
     fn synth_defaults_to_one_layer_and_presets_respect_the_four_layer_cap() {
@@ -602,6 +634,14 @@ mod tests {
                     .any(|preset| preset.name == expected)
             );
         }
+        let snare = SimpleWaveformSynth::PRESETS
+            .iter()
+            .find(|preset| preset.name == "Snare drum")
+            .expect("the snare preset should exist")
+            .synth;
+        assert_eq!(snare.layers[0].waveform, Waveform::Sine);
+        assert_eq!(snare.layers[1].waveform, Waveform::Noise);
+        assert_ne!(snare.pitch_shift, 0);
     }
 
     #[test]
@@ -611,6 +651,8 @@ mod tests {
         assert_eq!(Waveform::Square.sample(0.75, 0.0), -1.0);
         assert_eq!(Waveform::Sawtooth.sample(0.5, 0.0), 0.0);
         assert_eq!(Waveform::Noise.sample(0.5, -0.3), -0.3);
+        assert_ne!(noise_sample(100), noise_sample(101));
+        assert!((-1.0..=1.0).contains(&noise_sample(42)));
     }
 
     /// Note identities remain distinct so selection survives moving and resizing notes.

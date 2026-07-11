@@ -6,7 +6,7 @@ use crate::{
     audio::{self, AudioEngine},
     model::{
         ARRANGEMENT_STEPS, Clip, ClipSourceKind, FilterKind, PATTERN_STEPS, Project, STEPS_PER_BAR,
-        STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform,
+        STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
     },
     piano_roll, project_io,
 };
@@ -1020,10 +1020,7 @@ fn waveform_preview(ui: &mut egui::Ui, synth: &SimpleWaveformSynth) {
                 0.0
             };
             let phase = progress * 12.0 * 2.0_f32.powf(f32::from(synth.pitch_shift) / 12.0);
-            let value = (index as u32)
-                .wrapping_mul(747_796_405)
-                .wrapping_add(2_891_336_453);
-            let noise = (value as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            let noise = noise_sample(index as u32);
             let sample = synth
                 .layers
                 .iter()

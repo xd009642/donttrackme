@@ -10,6 +10,7 @@ use cpal::{
 
 use crate::model::{
     ARRANGEMENT_STEPS, FilterKind, Project, STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind,
+    noise_sample,
 };
 
 enum Command {
@@ -466,10 +467,7 @@ fn oscillator_sample(
     frequency: f32,
     sample_rate: f32,
 ) -> f32 {
-    let hash = (elapsed as u32)
-        .wrapping_mul(747_796_405)
-        .wrapping_add(frequency.to_bits());
-    let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
+    let noise = noise_sample(elapsed as u32 ^ frequency.to_bits());
     synth
         .layers
         .iter()
