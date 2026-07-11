@@ -8,6 +8,25 @@ pub enum Waveform {
     Noise,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SimpleWaveformSynth {
+    pub waveform: Waveform,
+    pub level: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+impl Default for SimpleWaveformSynth {
+    fn default() -> Self {
+        Self {
+            waveform: Waveform::Sine,
+            level: 0.8,
+            attack_ms: 5.0,
+            release_ms: 120.0,
+        }
+    }
+}
+
 impl Waveform {
     pub const ALL: [Self; 4] = [Self::Sine, Self::Square, Self::Sawtooth, Self::Noise];
 
@@ -19,11 +38,26 @@ impl Waveform {
             Self::Noise => "Noise",
         }
     }
+
+    pub fn sample(self, phase: f32, noise_sample: f32) -> f32 {
+        match self {
+            Self::Sine => (phase * std::f32::consts::TAU).sin(),
+            Self::Square => {
+                if phase.fract() < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Self::Sawtooth => phase.fract() * 2.0 - 1.0,
+            Self::Noise => noise_sample,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum TrackKind {
-    Instrument { waveform: Waveform },
+    Instrument { synth: SimpleWaveformSynth },
     Sample,
 }
 
@@ -79,7 +113,7 @@ impl Track {
             id,
             name,
             kind: TrackKind::Instrument {
-                waveform: Waveform::Sine,
+                synth: SimpleWaveformSynth::default(),
             },
             source_id,
             notes: Vec::new(),
@@ -220,7 +254,16 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{Project, Track};
+    use super::{Project, Track, Waveform};
+
+    #[test]
+    fn oscillator_waveforms_have_expected_phase_values() {
+        assert!((Waveform::Sine.sample(0.25, 0.0) - 1.0).abs() < f32::EPSILON * 4.0);
+        assert_eq!(Waveform::Square.sample(0.25, 0.0), 1.0);
+        assert_eq!(Waveform::Square.sample(0.75, 0.0), -1.0);
+        assert_eq!(Waveform::Sawtooth.sample(0.5, 0.0), 0.0);
+        assert_eq!(Waveform::Noise.sample(0.5, -0.3), -0.3);
+    }
 
     /// Note identities remain distinct so selection survives moving and resizing notes.
     #[test]

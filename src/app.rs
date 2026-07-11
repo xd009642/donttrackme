@@ -9,6 +9,7 @@ use crate::{
 enum View {
     Arrangement,
     PianoRoll,
+    Instrument,
 }
 
 #[derive(Debug)]
@@ -103,6 +104,7 @@ impl DawApp {
                     .is_some_and(|track| matches!(track.kind, TrackKind::Instrument { .. }));
                 ui.add_enabled_ui(piano_enabled, |ui| {
                     ui.selectable_value(&mut self.view, View::PianoRoll, "Piano roll");
+                    ui.selectable_value(&mut self.view, View::Instrument, "Instrument");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("Drop audio files anywhere to create sample tracks");
@@ -151,6 +153,15 @@ impl DawApp {
                                     |ui| {
                                         ui.toggle_value(&mut track.solo, "S");
                                         ui.toggle_value(&mut track.muted, "M");
+                                        if matches!(track.kind, TrackKind::Instrument { .. })
+                                            && ui
+                                                .small_button("⚙")
+                                                .on_hover_text("Instrument settings")
+                                                .clicked()
+                                        {
+                                            self.selected_track = Some(track.id);
+                                            self.view = View::Instrument;
+                                        }
                                     },
                                 );
                             });
@@ -537,14 +548,17 @@ impl DawApp {
             ui.heading(&track.name);
             ui.separator();
             ui.label("Instrument");
-            if let TrackKind::Instrument { waveform } = &mut track.kind {
+            if let TrackKind::Instrument { synth } = &mut track.kind {
                 egui::ComboBox::from_id_salt("waveform")
-                    .selected_text(waveform.name())
+                    .selected_text(synth.waveform.name())
                     .show_ui(ui, |ui| {
                         for choice in Waveform::ALL {
-                            ui.selectable_value(waveform, choice, choice.name());
+                            ui.selectable_value(&mut synth.waveform, choice, choice.name());
                         }
                     });
+                if ui.button("⚙ Settings").clicked() {
+                    self.view = View::Instrument;
+                }
             }
         });
         ui.separator();
@@ -554,6 +568,134 @@ impl DawApp {
             ui.label("Sample tracks do not have a piano roll.");
         }
     }
+
+    fn instrument_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(selected) = self.selected_track else {
+            ui.centered_and_justified(|ui| ui.label("Select an instrument track."));
+            return;
+        };
+        let Some(track) = self
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == selected)
+        else {
+            return;
+        };
+        let TrackKind::Instrument { synth } = &mut track.kind else {
+            ui.centered_and_justified(|ui| ui.label("The selected track is not an instrument."));
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.heading("Simple waveform");
+            ui.separator();
+            ui.label(&track.name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open piano roll").clicked() {
+                    self.view = View::PianoRoll;
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        egui::Frame::group(ui.style())
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.set_max_width(720.0);
+                ui.heading("Oscillator");
+                ui.horizontal(|ui| {
+                    for waveform in Waveform::ALL {
+                        ui.selectable_value(&mut synth.waveform, waveform, waveform.name());
+                    }
+                });
+                ui.add_space(10.0);
+                waveform_preview(
+                    ui,
+                    synth.waveform,
+                    synth.level,
+                    synth.attack_ms,
+                    synth.release_ms,
+                );
+                ui.add_space(12.0);
+                ui.label("Output level");
+                ui.add(egui::Slider::new(&mut synth.level, 0.0..=1.0).show_value(true));
+
+                ui.add_space(14.0);
+                ui.heading("Envelope");
+                ui.columns(2, |columns| {
+                    columns[0].label("Attack");
+                    columns[0].add(
+                        egui::Slider::new(&mut synth.attack_ms, 0.0..=2_000.0)
+                            .logarithmic(true)
+                            .suffix(" ms"),
+                    );
+                    columns[1].label("Release");
+                    columns[1].add(
+                        egui::Slider::new(&mut synth.release_ms, 5.0..=5_000.0)
+                            .logarithmic(true)
+                            .suffix(" ms"),
+                    );
+                });
+            });
+    }
+}
+
+fn waveform_preview(
+    ui: &mut egui::Ui,
+    waveform: Waveform,
+    level: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(680.0, 170.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 5.0, Color32::from_rgb(22, 26, 32));
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        egui::Stroke::new(1.0, Color32::from_gray(55)),
+    );
+    let held_ms = 500.0;
+    let preview_ms = attack_ms + held_ms + release_ms;
+    let note_off_ms = attack_ms + held_ms;
+    let mut envelope_points = Vec::with_capacity(257);
+    let points = (0..=256)
+        .map(|index| {
+            let progress = index as f32 / 256.0;
+            let time_ms = progress * preview_ms;
+            let envelope = if time_ms < attack_ms && attack_ms > 0.0 {
+                time_ms / attack_ms
+            } else if time_ms <= note_off_ms {
+                1.0
+            } else if release_ms > 0.0 {
+                1.0 - (time_ms - note_off_ms) / release_ms
+            } else {
+                0.0
+            };
+            let phase = progress * 12.0;
+            let value = (index as u32)
+                .wrapping_mul(747_796_405)
+                .wrapping_add(2_891_336_453);
+            let noise = (value as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            let sample = waveform.sample(phase, noise) * envelope;
+            envelope_points.push(egui::pos2(
+                rect.left() + rect.width() * progress,
+                rect.center().y - envelope * level * rect.height() * 0.42,
+            ));
+            egui::pos2(
+                rect.left() + rect.width() * progress,
+                rect.center().y - sample * level * rect.height() * 0.42,
+            )
+        })
+        .collect::<Vec<_>>();
+    ui.painter().add(egui::Shape::line(
+        points,
+        egui::Stroke::new(2.0, Color32::from_rgb(98, 220, 168)),
+    ));
+    ui.painter().add(egui::Shape::line(
+        envelope_points,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(90)),
+    ));
 }
 
 impl eframe::App for DawApp {
@@ -565,6 +707,7 @@ impl eframe::App for DawApp {
         egui::CentralPanel::default().show(root, |ui| match self.view {
             View::Arrangement => self.arrangement(ui),
             View::PianoRoll => self.editor(ui),
+            View::Instrument => self.instrument_settings(ui),
         });
 
         if context.input(|input| !input.raw.hovered_files.is_empty()) {
