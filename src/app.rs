@@ -88,6 +88,7 @@ pub struct DawApp {
     auditioned_notes: HashSet<u8>,
     project_path: Option<PathBuf>,
     project_status: Option<String>,
+    synth_mouse_pitch: Option<u8>,
 }
 
 impl DawApp {
@@ -111,6 +112,7 @@ impl DawApp {
             auditioned_notes: HashSet::new(),
             project_path: None,
             project_status: None,
+            synth_mouse_pitch: None,
         }
     }
 
@@ -139,7 +141,7 @@ impl DawApp {
 
     fn update_keyboard_audition(&mut self, context: &egui::Context) {
         let desired = context.input(|input| {
-            if self.view != View::PianoRoll
+            if !matches!(self.view, View::PianoRoll | View::Instrument)
                 || input.modifiers.command
                 || input.modifiers.ctrl
                 || input.modifiers.alt
@@ -179,6 +181,13 @@ impl DawApp {
             }
         }
         self.auditioned_notes = desired;
+        if self.view != View::Instrument
+            && let Some(pitch) = self.synth_mouse_pitch.take()
+            && let Some(audio) = &self.audio
+            && let Err(error) = audio.audition_stop(pitch)
+        {
+            self.audio_error = Some(error);
+        }
     }
 
     fn save_project(&mut self, choose_path: bool) {
@@ -941,6 +950,8 @@ impl DawApp {
         });
         ui.add_space(12.0);
 
+        let mut keyboard_output = SynthKeyboardOutput::default();
+        let mut mouse_pitch = self.synth_mouse_pitch;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_max_width(920.0);
             egui::Frame::group(ui.style())
@@ -1112,10 +1123,16 @@ impl DawApp {
                                 ui.horizontal(|ui| {
                                     ui.checkbox(&mut effect.enabled, "");
                                     ui.strong(format!("{}. {}", index + 1, effect.kind.name()));
-                                    if ui.small_button("↑").clicked() && index > 0 {
-                                        reorder = Some((index, index - 1));
-                                    }
-                                    if ui.small_button("↓").clicked() && index + 1 < 5 {
+                                if ui
+                                    .add_enabled(index > 0, egui::Button::new("Move up"))
+                                    .clicked()
+                                {
+                                    reorder = Some((index, index - 1));
+                                }
+                                if ui
+                                    .add_enabled(index + 1 < 5, egui::Button::new("Move down"))
+                                    .clicked()
+                                {
                                         reorder = Some((index, index + 1));
                                     }
                                     if !effect.enabled {
@@ -1197,8 +1214,126 @@ impl DawApp {
                         synth.effects.swap(from, to);
                     }
                 });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Test keyboard");
+                    ui.weak("Play with the mouse or the same computer-keyboard mapping as the piano roll.");
+                    keyboard_output = synth_test_keyboard(
+                        ui,
+                        &self.auditioned_notes,
+                        &mut mouse_pitch,
+                    );
+                });
         });
+        self.synth_mouse_pitch = mouse_pitch;
+        let audition_synth = *synth;
+        if let Some(audio) = &self.audio {
+            if let Some(pitch) = keyboard_output.note_off
+                && let Err(error) = audio.audition_stop(pitch)
+            {
+                self.audio_error = Some(error);
+            }
+            if let Some(pitch) = keyboard_output.note_on
+                && let Err(error) = audio.audition_start(pitch, audition_synth)
+            {
+                self.audio_error = Some(error);
+            }
+        }
     }
+}
+
+#[derive(Default)]
+struct SynthKeyboardOutput {
+    note_on: Option<u8>,
+    note_off: Option<u8>,
+}
+
+fn synth_test_keyboard(
+    ui: &mut egui::Ui,
+    keyboard_notes: &HashSet<u8>,
+    mouse_pitch: &mut Option<u8>,
+) -> SynthKeyboardOutput {
+    const FIRST_PITCH: u8 = 48;
+    const LAST_PITCH: u8 = 72;
+    const WHITE_WIDTH: f32 = 48.0;
+    const HEIGHT: f32 = 130.0;
+    let white_count = (FIRST_PITCH..=LAST_PITCH)
+        .filter(|pitch| !matches!(pitch % 12, 1 | 3 | 6 | 8 | 10))
+        .count();
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(white_count as f32 * WHITE_WIDTH, HEIGHT),
+        egui::Sense::click_and_drag(),
+    );
+    let painter = ui.painter();
+    let mut keys = Vec::with_capacity(25);
+    let mut white_index = 0;
+    for pitch in FIRST_PITCH..=LAST_PITCH {
+        if !matches!(pitch % 12, 1 | 3 | 6 | 8 | 10) {
+            let key = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + white_index as f32 * WHITE_WIDTH, rect.top()),
+                egui::vec2(WHITE_WIDTH, HEIGHT),
+            );
+            let playing = keyboard_notes.contains(&pitch) || *mouse_pitch == Some(pitch);
+            painter.rect_filled(
+                key,
+                0.0,
+                if playing {
+                    Color32::from_rgb(68, 164, 119)
+                } else {
+                    Color32::from_gray(220)
+                },
+            );
+            painter.rect_stroke(
+                key,
+                0.0,
+                egui::Stroke::new(1.0, Color32::from_gray(65)),
+                egui::StrokeKind::Inside,
+            );
+            keys.push((pitch, key, false));
+            white_index += 1;
+        }
+    }
+    white_index = 0;
+    for pitch in FIRST_PITCH..LAST_PITCH {
+        if matches!(pitch % 12, 1 | 3 | 6 | 8 | 10) {
+            let key = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + white_index as f32 * WHITE_WIDTH - WHITE_WIDTH * 0.31,
+                    rect.top(),
+                ),
+                egui::vec2(WHITE_WIDTH * 0.62, HEIGHT * 0.62),
+            );
+            let playing = keyboard_notes.contains(&pitch) || *mouse_pitch == Some(pitch);
+            painter.rect_filled(
+                key,
+                2.0,
+                if playing {
+                    Color32::from_rgb(54, 137, 98)
+                } else {
+                    Color32::from_gray(35)
+                },
+            );
+            keys.push((pitch, key, true));
+        } else {
+            white_index += 1;
+        }
+    }
+
+    let mut output = SynthKeyboardOutput::default();
+    if ui.input(|input| input.pointer.primary_released()) {
+        output.note_off = mouse_pitch.take();
+    }
+    if response.hovered()
+        && ui.input(|input| input.pointer.primary_pressed())
+        && let Some(pointer) = ui.input(|input| input.pointer.press_origin())
+        && let Some((pitch, _, _)) = keys.iter().rev().find(|(_, key, _)| key.contains(pointer))
+    {
+        *mouse_pitch = Some(*pitch);
+        output.note_on = Some(*pitch);
+    }
+    output
 }
 
 fn waveform_preview(ui: &mut egui::Ui, synth: &SimpleWaveformSynth) {
