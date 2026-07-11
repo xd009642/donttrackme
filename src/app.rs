@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
+    audio::AudioEngine,
     model::{Clip, ClipSourceKind, Project, TrackKind, Waveform},
     piano_roll,
 };
@@ -37,11 +38,17 @@ pub struct DawApp {
     selected_clip: Option<(u64, u64)>,
     clip_drag: Option<ClipDrag>,
     clip_clipboard: Option<Clip>,
+    audio: Option<AudioEngine>,
+    audio_error: Option<String>,
 }
 
 impl DawApp {
     pub fn new(context: &eframe::CreationContext<'_>) -> Self {
         context.egui_ctx.set_visuals(egui::Visuals::dark());
+        let (audio, audio_error) = match AudioEngine::new() {
+            Ok(audio) => (Some(audio), None),
+            Err(error) => (None, Some(error)),
+        };
         Self {
             project: Project::default(),
             selected_track: Some(1),
@@ -51,6 +58,8 @@ impl DawApp {
             selected_clip: None,
             clip_drag: None,
             clip_clipboard: None,
+            audio,
+            audio_error,
         }
     }
 
@@ -86,7 +95,19 @@ impl DawApp {
                     .button(if self.playing { "■ Stop" } else { "▶ Play" })
                     .clicked()
                 {
-                    self.playing = !self.playing;
+                    let result = if self.playing {
+                        self.audio.as_ref().map(AudioEngine::stop)
+                    } else {
+                        self.audio.as_ref().map(|audio| audio.play(&self.project))
+                    };
+                    match result {
+                        Some(Ok(())) => {
+                            self.playing = !self.playing;
+                            self.audio_error = None;
+                        }
+                        Some(Err(error)) => self.audio_error = Some(error),
+                        None => {}
+                    }
                 }
                 ui.button("● Record")
                     .on_hover_text("Audio recording is not implemented yet");
@@ -107,7 +128,12 @@ impl DawApp {
                     ui.selectable_value(&mut self.view, View::Instrument, "Instrument");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("Drop audio files anywhere to create sample tracks");
+                    if let Some(error) = &self.audio_error {
+                        ui.colored_label(Color32::from_rgb(245, 115, 105), "Audio unavailable")
+                            .on_hover_text(error);
+                    } else {
+                        ui.label("Drop audio files anywhere to create sample tracks");
+                    }
                 });
             });
         });

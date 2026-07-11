@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod model;
 mod piano_roll;
 
