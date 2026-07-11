@@ -21,6 +21,8 @@ use crate::model::{
 enum Command {
     Play(PlaybackPlan),
     Stop,
+    Pause,
+    Resume,
     AuditionStart {
         pitch: u8,
         synth: SimpleWaveformSynth,
@@ -161,6 +163,28 @@ impl AudioEngine {
     pub fn stop(&self) -> Result<(), String> {
         self.commands
             .send(Command::Stop)
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn pause(&self) -> Result<(), String> {
+        self.commands
+            .send(Command::Pause)
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn resume(&self) -> Result<(), String> {
+        self.commands
+            .send(Command::Resume)
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn play_pattern(&self, project: &Project, pattern_id: u64) -> Result<(), String> {
+        self.commands
+            .send(Command::Play(PlaybackPlan::from_pattern(
+                project,
+                pattern_id,
+                self.sample_rate,
+            )?))
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
@@ -332,6 +356,81 @@ impl PlaybackPlan {
             loop_samples: (f32::from(ARRANGEMENT_STEPS) * samples_per_step).round() as u64,
         })
     }
+
+    fn from_pattern(project: &Project, pattern_id: u64, sample_rate: f32) -> Result<Self, String> {
+        let source = project
+            .source(pattern_id)
+            .ok_or_else(|| "The selected pattern is no longer in the library".to_owned())?;
+        let pattern = project
+            .pattern(pattern_id)
+            .ok_or_else(|| "The selected clip is not a pattern".to_owned())?;
+        let channel = project
+            .tracks
+            .iter()
+            .find(|track| track.id == source.channel_id)
+            .ok_or_else(|| "The pattern's instrument channel is missing".to_owned())?;
+        let instrument = match &channel.kind {
+            TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
+            TrackKind::Sampler { sampler } => {
+                let path = sampler
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| "Load a WAV into the sampler first".to_owned())?;
+                RenderInstrument::Sampler {
+                    sampler: sampler.clone(),
+                    sample: Arc::new(load_wav(path)?),
+                }
+            }
+            TrackKind::Sample => return Err("Sample tracks do not have patterns".to_owned()),
+        };
+        let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
+        let mut voices = pattern
+            .notes
+            .iter()
+            .map(|note| {
+                let frequency = match &instrument {
+                    RenderInstrument::Synth(synth) => {
+                        pitch_frequency(note.pitch, synth.pitch_shift)
+                    }
+                    RenderInstrument::Sampler { sampler, .. } => {
+                        2.0_f32.powf((f32::from(note.pitch) - f32::from(sampler.root_pitch)) / 12.0)
+                            * sampler.speed
+                    }
+                };
+                Voice {
+                    start_sample: (f32::from(note.start_step) * samples_per_step).round() as u64,
+                    note_off_sample: (f32::from(note.start_step + note.length_steps)
+                        * samples_per_step)
+                        .round() as u64,
+                    frequency,
+                    glide_from_frequency: frequency,
+                    gain: f32::from(note.velocity) / 127.0,
+                    filter: FilterState::default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        voices.sort_by_key(|voice| voice.start_sample);
+        if matches!(&instrument, RenderInstrument::Synth(synth) if synth.mono) {
+            for index in 1..voices.len() {
+                voices[index].glide_from_frequency = voices[index - 1].frequency;
+                voices[index - 1].note_off_sample = voices[index - 1]
+                    .note_off_sample
+                    .min(voices[index].start_sample);
+            }
+        }
+        let effects = match &instrument {
+            RenderInstrument::Synth(synth) => EffectChain::new(synth.effects, sample_rate),
+            RenderInstrument::Sampler { .. } => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
+        };
+        Ok(Self {
+            channels: vec![ChannelPlan {
+                instrument,
+                voices,
+                effects,
+            }],
+            loop_samples: (f32::from(source.length_steps) * samples_per_step).round() as u64,
+        })
+    }
 }
 
 fn build_stream<T>(
@@ -358,6 +457,7 @@ struct Renderer {
     receiver: Receiver<Command>,
     plan: Option<PlaybackPlan>,
     position: u64,
+    paused: bool,
     sample_rate: f32,
     audition_voices: Vec<AuditionVoice>,
     audition_effects: Option<EffectChain>,
@@ -392,6 +492,7 @@ impl Renderer {
             receiver,
             plan: None,
             position: 0,
+            paused: false,
             sample_rate,
             audition_voices: Vec::with_capacity(40),
             audition_effects: None,
@@ -422,10 +523,18 @@ impl Renderer {
                 Command::Play(plan) => {
                     self.plan = Some(plan);
                     self.position = 0;
+                    self.paused = false;
                 }
                 Command::Stop => {
                     self.plan = None;
                     self.position = 0;
+                    self.paused = false;
+                }
+                Command::Pause => self.paused = true,
+                Command::Resume => {
+                    if self.plan.is_some() {
+                        self.paused = false;
+                    }
                 }
                 Command::AuditionStart { pitch, synth } => self.start_audition(pitch, synth),
                 Command::AuditionStop { pitch } => {
@@ -506,7 +615,9 @@ impl Renderer {
 
     fn next_frame(&mut self) -> [f32; 2] {
         let mut output = [0.0, 0.0];
-        if let Some(plan) = &mut self.plan {
+        if !self.paused
+            && let Some(plan) = &mut self.plan
+        {
             for channel in &mut plan.channels {
                 let mut channel_output = [0.0, 0.0];
                 match &mut channel.instrument {
@@ -1279,5 +1390,53 @@ mod tests {
             plan.channels[0].instrument,
             RenderInstrument::Sampler { .. }
         ));
+    }
+
+    #[test]
+    fn pattern_playback_ignores_the_rest_of_the_arrangement() {
+        let mut project = Project::default();
+        let first_pattern = project.tracks[0].source_id;
+        project
+            .add_note(first_pattern, 60, 0, 2, 100)
+            .expect("first pattern should exist");
+        let second_channel = project.add_instrument();
+        let second_pattern = project
+            .tracks
+            .iter()
+            .find(|track| track.id == second_channel)
+            .expect("second channel should exist")
+            .source_id;
+        project
+            .add_note(second_pattern, 72, 0, 2, 100)
+            .expect("second pattern should exist");
+        project.ensure_primary_pattern_clip(second_channel);
+
+        let plan = PlaybackPlan::from_pattern(&project, first_pattern, 48_000.0)
+            .expect("pattern should build a playback plan");
+
+        assert_eq!(plan.channels.len(), 1);
+        assert_eq!(plan.channels[0].voices.len(), 1);
+        assert_eq!(plan.channels[0].voices[0].frequency, pitch_frequency(60, 0));
+    }
+
+    #[test]
+    fn pausing_does_not_advance_the_playback_position() {
+        let mut project = Project::default();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 60, 0, 2, 100)
+            .expect("pattern should exist");
+        let plan = PlaybackPlan::from_pattern(&project, pattern_id, 48_000.0)
+            .expect("pattern should build a playback plan");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut renderer = super::Renderer::new(receiver, 48_000.0);
+        renderer.plan = Some(plan);
+
+        renderer.next_frame();
+        renderer.paused = true;
+        let paused_at = renderer.position;
+        renderer.next_frame();
+
+        assert_eq!(renderer.position, paused_at);
     }
 }

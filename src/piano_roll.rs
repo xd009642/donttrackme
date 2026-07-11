@@ -40,8 +40,10 @@ pub struct PianoRoll {
     clipboard_offset: u16,
     drag: Option<Drag>,
     pattern_id: Option<u64>,
-    scroll_to_middle_c: bool,
+    scroll_to_initial_pitch: bool,
     mouse_pitch: Option<u8>,
+    insertion_length: u16,
+    clipboard_status: Option<String>,
 }
 
 #[derive(Default)]
@@ -63,7 +65,7 @@ impl PianoRoll {
             self.selected.clear();
             self.drag = None;
             self.pattern_id = Some(pattern_id);
-            self.scroll_to_middle_c = true;
+            self.scroll_to_initial_pitch = true;
         }
         if ui.input(|input| input.pointer.primary_released())
             && let Some(pitch) = self.mouse_pitch.take()
@@ -78,10 +80,24 @@ impl PianoRoll {
             );
             ui.separator();
             ui.weak("Ctrl/Cmd+C, X, V · Delete");
+            if let Some(status) = &self.clipboard_status {
+                ui.separator();
+                ui.label(status);
+            }
         });
         ui.weak("Play: Z…/ and Q…] are consecutive white keys · / = B3 · Q = C4");
 
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+        let initial_pitch = pattern.notes.first().map_or(60, |note| note.pitch);
+        let initial_row = PITCH_COUNT - 1 - (initial_pitch - LOWEST_PITCH);
+        let initial_scroll_offset =
+            (f32::from(initial_row) * KEY_HEIGHT - ui.available_height() * 0.5 + KEY_HEIGHT * 0.5)
+                .max(0.0);
+        let mut scroll_area = egui::ScrollArea::both().auto_shrink(false);
+        if self.scroll_to_initial_pitch {
+            scroll_area = scroll_area.vertical_scroll_offset(initial_scroll_offset);
+            self.scroll_to_initial_pitch = false;
+        }
+        scroll_area.show(ui, |ui| {
             let grid_height = KEY_HEIGHT * f32::from(PITCH_COUNT);
             let size = Vec2::new(
                 KEYBOARD_WIDTH + STEP_WIDTH * f32::from(STEPS),
@@ -93,15 +109,6 @@ impl PianoRoll {
                 Pos2::new(rect.left() + KEYBOARD_WIDTH, rect.top()),
                 Vec2::new(STEP_WIDTH * f32::from(STEPS), grid_height),
             );
-            if self.scroll_to_middle_c {
-                let c4_row = PITCH_COUNT - 1 - (60 - LOWEST_PITCH);
-                let target = Rect::from_min_size(
-                    Pos2::new(grid.left(), grid.top() + f32::from(c4_row) * KEY_HEIGHT),
-                    Vec2::new(grid.width(), KEY_HEIGHT),
-                );
-                ui.scroll_to_rect(target, Some(egui::Align::Center));
-                self.scroll_to_middle_c = false;
-            }
             let velocity = Rect::from_min_max(
                 Pos2::new(grid.left(), grid.bottom() + 28.0),
                 Pos2::new(grid.right(), grid.bottom() + 28.0 + VELOCITY_HEIGHT),
@@ -139,6 +146,11 @@ impl PianoRoll {
             }
 
             if response.drag_stopped() {
+                if let Some(Drag::Resize { note_id, .. }) = self.drag
+                    && let Some(note) = pattern.notes.iter().find(|note| note.id == note_id)
+                {
+                    self.insertion_length = note.length_steps;
+                }
                 self.drag = None;
             }
         });
@@ -209,20 +221,27 @@ impl PianoRoll {
             let step = ((pointer.x - grid.left()) / STEP_WIDTH).floor() as u16;
             let row = ((pointer.y - grid.top()) / KEY_HEIGHT).floor() as u8;
             let pitch = LOWEST_PITCH + PITCH_COUNT - 1 - row;
-            let id = pattern.add_note(pitch, step, 1, 100);
+            let id = pattern.add_note(
+                pitch,
+                step,
+                self.insertion_length.max(1).min(STEPS - step),
+                100,
+            );
             self.selected.clear();
             self.selected.insert(id);
         }
     }
 
     fn keyboard_shortcuts(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
-        let (copy, cut, paste, delete) = ui.input(|input| {
+        let (copy, cut, paste) = ui.input_mut(|input| {
             (
-                input.modifiers.command && input.key_pressed(egui::Key::C),
-                input.modifiers.command && input.key_pressed(egui::Key::X),
-                input.modifiers.command && input.key_pressed(egui::Key::V),
-                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::X),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
             )
+        });
+        let delete = ui.input(|input| {
+            input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
         });
         if copy || cut {
             self.clipboard = pattern
@@ -232,6 +251,7 @@ impl PianoRoll {
                 .copied()
                 .collect();
             self.clipboard_offset = STEPS_PER_BEAT;
+            self.clipboard_status = Some(format!("Copied {} note(s)", self.clipboard.len()));
         }
         if cut || delete {
             pattern
@@ -241,6 +261,9 @@ impl PianoRoll {
         }
         if paste && !self.clipboard.is_empty() {
             self.paste_clipboard(pattern);
+            self.clipboard_status = Some(format!("Pasted {} note(s)", self.clipboard.len()));
+        } else if paste {
+            self.clipboard_status = Some("Nothing to paste".to_owned());
         }
     }
 

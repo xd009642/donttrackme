@@ -117,6 +117,8 @@ pub struct DawApp {
     selected_track: Option<u64>,
     view: View,
     playing: bool,
+    transport_paused: bool,
+    transport_pattern: Option<u64>,
     piano_roll: piano_roll::PianoRoll,
     selected_clip: Option<(u64, u64)>,
     clip_drag: Option<ClipDrag>,
@@ -128,6 +130,7 @@ pub struct DawApp {
     project_status: Option<String>,
     synth_mouse_pitch: Option<u8>,
     tap_tempo: TapTempo,
+    space_was_down: bool,
 }
 
 impl DawApp {
@@ -142,6 +145,8 @@ impl DawApp {
             selected_track: Some(1),
             view: View::Arrangement,
             playing: false,
+            transport_paused: false,
+            transport_pattern: None,
             piano_roll: piano_roll::PianoRoll::default(),
             selected_clip: None,
             clip_drag: None,
@@ -153,6 +158,7 @@ impl DawApp {
             project_status: None,
             synth_mouse_pitch: None,
             tap_tempo: TapTempo::default(),
+            space_was_down: false,
         }
     }
 
@@ -269,7 +275,7 @@ impl DawApp {
         };
         match project_io::load(&path) {
             Ok(project) => {
-                if self.playing
+                if (self.playing || self.transport_paused)
                     && let Some(audio) = &self.audio
                     && let Err(error) = audio.stop()
                 {
@@ -282,6 +288,8 @@ impl DawApp {
                 self.clip_clipboard = None;
                 self.piano_roll = piano_roll::PianoRoll::default();
                 self.playing = false;
+                self.transport_paused = false;
+                self.transport_pattern = None;
                 self.view = View::Arrangement;
                 self.project_path = Some(path);
                 self.project_status = Some("Project loaded".to_owned());
@@ -304,6 +312,63 @@ impl DawApp {
         });
     }
 
+    fn current_pattern_id(&self) -> Option<u64> {
+        self.selected_clip
+            .and_then(|(lane_id, clip_id)| {
+                self.project
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == lane_id)
+                    .and_then(|track| track.clips.iter().find(|clip| clip.id == clip_id))
+                    .map(|clip| clip.source_id)
+            })
+            .or_else(|| {
+                self.selected_track.and_then(|track_id| {
+                    self.project
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .map(|track| track.source_id)
+                })
+            })
+    }
+
+    fn toggle_transport(&mut self) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        let desired_pattern = if self.view == View::PianoRoll {
+            self.current_pattern_id()
+        } else {
+            None
+        };
+        let result = if self.playing {
+            audio.pause()
+        } else if self.transport_paused && desired_pattern == self.transport_pattern {
+            audio.resume()
+        } else if self.view == View::PianoRoll {
+            desired_pattern
+                .ok_or_else(|| "Select a pattern to play".to_owned())
+                .and_then(|pattern_id| audio.play_pattern(&self.project, pattern_id))
+        } else {
+            audio.play(&self.project)
+        };
+        match result {
+            Ok(()) => {
+                if self.playing {
+                    self.playing = false;
+                    self.transport_paused = true;
+                } else {
+                    self.playing = true;
+                    self.transport_paused = false;
+                    self.transport_pattern = desired_pattern;
+                }
+                self.audio_error = None;
+            }
+            Err(error) => self.audio_error = Some(error),
+        }
+    }
+
     fn top_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("transport").show(root, |ui| {
             ui.horizontal(|ui| {
@@ -322,22 +387,31 @@ impl DawApp {
                     self.export_wav();
                 }
                 ui.separator();
+                let transport_label = if self.playing {
+                    "Pause"
+                } else if self.transport_paused {
+                    "Resume"
+                } else {
+                    "Play"
+                };
+                if ui.button(transport_label).clicked() {
+                    self.toggle_transport();
+                }
                 if ui
-                    .button(if self.playing { "■ Stop" } else { "▶ Play" })
+                    .add_enabled(
+                        self.playing || self.transport_paused,
+                        egui::Button::new("Stop"),
+                    )
                     .clicked()
+                    && let Some(audio) = &self.audio
                 {
-                    let result = if self.playing {
-                        self.audio.as_ref().map(AudioEngine::stop)
-                    } else {
-                        self.audio.as_ref().map(|audio| audio.play(&self.project))
-                    };
-                    match result {
-                        Some(Ok(())) => {
-                            self.playing = !self.playing;
-                            self.audio_error = None;
+                    match audio.stop() {
+                        Ok(()) => {
+                            self.playing = false;
+                            self.transport_paused = false;
+                            self.transport_pattern = None;
                         }
-                        Some(Err(error)) => self.audio_error = Some(error),
-                        None => {}
+                        Err(error) => self.audio_error = Some(error),
                     }
                 }
                 ui.button("● Record")
@@ -1709,6 +1783,11 @@ impl eframe::App for DawApp {
         let context = root.ctx().clone();
         self.add_dropped_samples(&context);
         self.update_keyboard_audition(&context);
+        let space_down = context.input(|input| input.key_down(egui::Key::Space));
+        if !self.tap_tempo.open && space_down && !self.space_was_down {
+            self.toggle_transport();
+        }
+        self.space_was_down = space_down;
         self.top_bar(root);
         self.track_list(root);
         egui::CentralPanel::default().show(root, |ui| match self.view {
