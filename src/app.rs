@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{self, Color32, RichText};
 
@@ -16,6 +20,40 @@ enum View {
     Arrangement,
     PianoRoll,
     Instrument,
+}
+
+#[derive(Default)]
+struct TapTempo {
+    open: bool,
+    taps: Vec<Instant>,
+    bpm: Option<f32>,
+    key_was_down: bool,
+}
+
+impl TapTempo {
+    fn record(&mut self, now: Instant) -> Option<f32> {
+        if self
+            .taps
+            .last()
+            .is_some_and(|previous| now.duration_since(*previous) > Duration::from_secs(3))
+        {
+            self.taps.clear();
+        }
+        self.taps.push(now);
+        self.bpm = if self.taps.len() >= 2 {
+            let elapsed = now.duration_since(self.taps[0]).as_secs_f32();
+            Some(60.0 * (self.taps.len() - 1) as f32 / elapsed)
+        } else {
+            None
+        };
+        self.bpm
+    }
+
+    fn reset(&mut self) {
+        self.taps.clear();
+        self.bpm = None;
+        self.key_was_down = false;
+    }
 }
 
 const PIANO_KEYS: [(egui::Key, u8); 37] = [
@@ -89,6 +127,7 @@ pub struct DawApp {
     project_path: Option<PathBuf>,
     project_status: Option<String>,
     synth_mouse_pitch: Option<u8>,
+    tap_tempo: TapTempo,
 }
 
 impl DawApp {
@@ -113,6 +152,7 @@ impl DawApp {
             project_path: None,
             project_status: None,
             synth_mouse_pitch: None,
+            tap_tempo: TapTempo::default(),
         }
     }
 
@@ -300,6 +340,10 @@ impl DawApp {
                         .range(20.0..=300.0)
                         .speed(0.5),
                 );
+                if ui.button("Tap").clicked() {
+                    self.tap_tempo.open = true;
+                    self.tap_tempo.reset();
+                }
                 ui.separator();
                 ui.selectable_value(&mut self.view, View::Arrangement, "Arrangement");
                 let piano_enabled = self
@@ -321,6 +365,58 @@ impl DawApp {
                 });
             });
         });
+    }
+
+    fn tap_tempo_window(&mut self, context: &egui::Context) {
+        if !self.tap_tempo.open {
+            return;
+        }
+        let key_down = context
+            .input(|input| input.key_down(egui::Key::Space) || input.key_down(egui::Key::Enter));
+        let keyboard_tap = key_down && !self.tap_tempo.key_was_down;
+        self.tap_tempo.key_was_down = key_down;
+        let mut open = self.tap_tempo.open;
+        let mut button_tap = false;
+        let mut reset = false;
+        egui::Window::new("Tap tempo")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.set_min_width(300.0);
+                ui.label("Tap once per beat using Space, Enter, or the button.");
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([300.0, 90.0], egui::Button::new("TAP"))
+                    .clicked()
+                {
+                    button_tap = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("Taps: {}", self.tap_tempo.taps.len()));
+                    ui.separator();
+                    if let Some(bpm) = self.tap_tempo.bpm {
+                        ui.heading(format!("{bpm:.1} BPM"));
+                    } else {
+                        ui.weak("Tap again to calculate BPM");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Reset").clicked() {
+                            reset = true;
+                        }
+                    });
+                });
+            });
+        self.tap_tempo.open = open;
+        if reset {
+            self.tap_tempo.reset();
+        }
+        if (keyboard_tap || button_tap)
+            && let Some(bpm) = self.tap_tempo.record(Instant::now())
+        {
+            self.project.bpm = bpm.clamp(20.0, 300.0);
+        }
     }
 
     fn track_list(&mut self, root: &mut egui::Ui) {
@@ -1408,6 +1504,7 @@ impl eframe::App for DawApp {
             View::PianoRoll => self.editor(ui),
             View::Instrument => self.instrument_settings(ui),
         });
+        self.tap_tempo_window(&context);
 
         if context.input(|input| !input.raw.hovered_files.is_empty()) {
             let painter = context.layer_painter(egui::LayerId::new(
@@ -1432,7 +1529,9 @@ impl eframe::App for DawApp {
 
 #[cfg(test)]
 mod tests {
-    use super::PIANO_KEYS;
+    use std::time::{Duration, Instant};
+
+    use super::{PIANO_KEYS, TapTempo};
     use eframe::egui::Key;
 
     #[test]
@@ -1449,5 +1548,22 @@ mod tests {
         assert_eq!(pitch(Key::Q), 60);
         assert_eq!(pitch(Key::Num2), 61);
         assert_eq!(pitch(Key::W), 62);
+    }
+
+    #[test]
+    fn tap_tempo_uses_the_mean_interval_and_resets_after_a_pause() {
+        let start = Instant::now();
+        let mut tap = TapTempo::default();
+
+        assert_eq!(tap.record(start), None);
+        tap.record(start + Duration::from_millis(500));
+        tap.record(start + Duration::from_millis(1_000));
+        let bpm = tap
+            .record(start + Duration::from_millis(1_500))
+            .expect("two or more taps should produce a tempo");
+
+        assert!((bpm - 120.0).abs() < f32::EPSILON);
+        assert_eq!(tap.record(start + Duration::from_secs(5)), None);
+        assert_eq!(tap.taps.len(), 1);
     }
 }
