@@ -9,8 +9,8 @@ use cpal::{
 };
 
 use crate::model::{
-    ARRANGEMENT_STEPS, FilterKind, Project, STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind,
-    noise_sample,
+    ARRANGEMENT_STEPS, EffectKind, EffectSlot, FilterKind, Project, STEPS_PER_BEAT,
+    SimpleWaveformSynth, TrackKind, noise_sample,
 };
 
 enum Command {
@@ -26,8 +26,14 @@ enum Command {
 }
 
 struct PlaybackPlan {
-    voices: Vec<Voice>,
+    channels: Vec<ChannelPlan>,
     loop_samples: u64,
+}
+
+struct ChannelPlan {
+    synth: SimpleWaveformSynth,
+    voices: Vec<Voice>,
+    effects: EffectChain,
 }
 
 struct Voice {
@@ -36,7 +42,6 @@ struct Voice {
     frequency: f32,
     glide_from_frequency: f32,
     gain: f32,
-    synth: SimpleWaveformSynth,
     filter: FilterState,
 }
 
@@ -44,6 +49,34 @@ struct Voice {
 struct FilterState {
     low: f32,
     band: f32,
+}
+
+struct EffectChain {
+    slots: [EffectSlot; 5],
+    states: Vec<EffectState>,
+}
+
+enum EffectState {
+    Distortion,
+    Delay {
+        buffer: Vec<[f32; 2]>,
+        position: usize,
+    },
+    Chorus {
+        buffer: Vec<[f32; 2]>,
+        position: usize,
+        phase: f32,
+    },
+    Tremolo {
+        phase: f32,
+    },
+    Reverb {
+        left: Vec<f32>,
+        right: Vec<f32>,
+        left_position: usize,
+        right_position: usize,
+        damped: [f32; 2],
+    },
 }
 
 pub struct AudioEngine {
@@ -152,7 +185,7 @@ impl PlaybackPlan {
     fn from_project(project: &Project, sample_rate: f32) -> Self {
         let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
         let any_solo = project.tracks.iter().any(|track| track.solo);
-        let mut voices = Vec::new();
+        let mut channels = Vec::new();
 
         for channel in &project.tracks {
             if channel.muted || (any_solo && !channel.solo) {
@@ -191,7 +224,6 @@ impl PlaybackPlan {
                             frequency,
                             glide_from_frequency: frequency,
                             gain: f32::from(note.velocity) / 127.0,
-                            synth,
                             filter: FilterState::default(),
                         });
                     }
@@ -211,11 +243,17 @@ impl PlaybackPlan {
                     }
                 }
             }
-            voices.extend(channel_voices);
+            if !channel_voices.is_empty() {
+                channels.push(ChannelPlan {
+                    synth,
+                    voices: channel_voices,
+                    effects: EffectChain::new(synth.effects, sample_rate),
+                });
+            }
         }
 
         Self {
-            voices,
+            channels,
             loop_samples: (f32::from(ARRANGEMENT_STEPS) * samples_per_step).round() as u64,
         }
     }
@@ -247,6 +285,7 @@ struct Renderer {
     position: u64,
     sample_rate: f32,
     audition_voices: Vec<AuditionVoice>,
+    audition_effects: Option<EffectChain>,
 }
 
 struct AuditionVoice {
@@ -268,6 +307,7 @@ impl Renderer {
             position: 0,
             sample_rate,
             audition_voices: Vec::with_capacity(40),
+            audition_effects: None,
         }
     }
 
@@ -315,6 +355,9 @@ impl Renderer {
     }
 
     fn start_audition(&mut self, pitch: u8, synth: SimpleWaveformSynth) {
+        if self.audition_voices.is_empty() {
+            self.audition_effects = Some(EffectChain::new(synth.effects, self.sample_rate));
+        }
         let frequency = pitch_frequency(pitch, synth.pitch_shift);
         if synth.mono
             && let Some(voice) = self.audition_voices.first_mut()
@@ -349,40 +392,50 @@ impl Renderer {
     fn next_frame(&mut self) -> [f32; 2] {
         let mut output = [0.0, 0.0];
         if let Some(plan) = &mut self.plan {
-            for voice in &mut plan.voices {
-                if self.position < voice.start_sample {
-                    continue;
+            for channel in &mut plan.channels {
+                let mut channel_output = [0.0, 0.0];
+                for voice in &mut channel.voices {
+                    if self.position < voice.start_sample {
+                        continue;
+                    }
+                    let elapsed = self.position - voice.start_sample;
+                    let release_samples = ms_samples(channel.synth.release_ms, self.sample_rate);
+                    if self.position >= voice.note_off_sample + release_samples {
+                        continue;
+                    }
+                    let note_length = voice.note_off_sample - voice.start_sample;
+                    let envelope =
+                        note_envelope(&channel.synth, elapsed, note_length, self.sample_rate);
+                    let frequency = glide_frequency(
+                        voice.glide_from_frequency,
+                        voice.frequency,
+                        elapsed,
+                        ms_samples(channel.synth.glide_ms, self.sample_rate),
+                    );
+                    let raw =
+                        oscillator_sample(&channel.synth, elapsed, frequency, self.sample_rate)
+                            * envelope
+                            * voice.gain
+                            * channel.synth.master_level;
+                    let filtered = voice.filter.process(raw, &channel.synth, self.sample_rate);
+                    add_panned(&mut channel_output, filtered, channel.synth.pan);
                 }
-                let elapsed = self.position - voice.start_sample;
-                let release_samples = ms_samples(voice.synth.release_ms, self.sample_rate);
-                if self.position >= voice.note_off_sample + release_samples {
-                    continue;
-                }
-                let note_length = voice.note_off_sample - voice.start_sample;
-                let envelope = note_envelope(&voice.synth, elapsed, note_length, self.sample_rate);
-                let glide_samples = ms_samples(voice.synth.glide_ms, self.sample_rate);
-                let frequency = glide_frequency(
-                    voice.glide_from_frequency,
-                    voice.frequency,
-                    elapsed,
-                    glide_samples,
-                );
-                let raw = oscillator_sample(&voice.synth, elapsed, frequency, self.sample_rate)
-                    * envelope
-                    * voice.gain
-                    * voice.synth.master_level;
-                let filtered = voice.filter.process(raw, &voice.synth, self.sample_rate);
-                add_panned(&mut output, filtered, voice.synth.pan);
+                let effected = channel.effects.process(channel_output, self.sample_rate);
+                output[0] += effected[0];
+                output[1] += effected[1];
             }
             self.position += 1;
             if self.position >= plan.loop_samples {
                 self.position = 0;
-                for voice in &mut plan.voices {
-                    voice.filter = FilterState::default();
+                for channel in &mut plan.channels {
+                    for voice in &mut channel.voices {
+                        voice.filter = FilterState::default();
+                    }
                 }
             }
         }
 
+        let mut audition_output = [0.0, 0.0];
         for voice in &mut self.audition_voices {
             let envelope = match voice.released_at {
                 Some((released_at, release_level)) => {
@@ -407,7 +460,7 @@ impl Renderer {
                 * envelope
                 * voice.synth.master_level;
             let filtered = voice.filter.process(raw, &voice.synth, self.sample_rate);
-            add_panned(&mut output, filtered, voice.synth.pan);
+            add_panned(&mut audition_output, filtered, voice.synth.pan);
             voice.elapsed += 1;
             voice.glide_elapsed += 1;
         }
@@ -416,6 +469,11 @@ impl Renderer {
                 voice.elapsed < released_at + ms_samples(voice.synth.release_ms, self.sample_rate)
             })
         });
+        if let Some(effects) = &mut self.audition_effects {
+            let effected = effects.process(audition_output, self.sample_rate);
+            output[0] += effected[0];
+            output[1] += effected[1];
+        }
 
         [output[0].tanh(), output[1].tanh()]
     }
@@ -438,6 +496,129 @@ impl FilterState {
             FilterKind::HighPass => high,
             FilterKind::BandPass => self.band,
         }
+    }
+}
+
+impl EffectChain {
+    fn new(slots: [EffectSlot; 5], sample_rate: f32) -> Self {
+        let states = slots
+            .iter()
+            .map(|slot| match slot.kind {
+                EffectKind::Distortion { .. } => EffectState::Distortion,
+                EffectKind::Delay { time_ms, .. } => EffectState::Delay {
+                    buffer: vec![[0.0, 0.0]; ms_samples(time_ms, sample_rate).max(1) as usize],
+                    position: 0,
+                },
+                EffectKind::Chorus { .. } => EffectState::Chorus {
+                    buffer: vec![[0.0, 0.0]; (sample_rate * 0.06).round().max(1.0) as usize],
+                    position: 0,
+                    phase: 0.0,
+                },
+                EffectKind::Tremolo { .. } => EffectState::Tremolo { phase: 0.0 },
+                EffectKind::Reverb { room_size, .. } => EffectState::Reverb {
+                    left: vec![0.0; (sample_rate * (0.035 + room_size * 0.065)).round() as usize],
+                    right: vec![0.0; (sample_rate * (0.043 + room_size * 0.079)).round() as usize],
+                    left_position: 0,
+                    right_position: 0,
+                    damped: [0.0, 0.0],
+                },
+            })
+            .collect();
+        Self { slots, states }
+    }
+
+    fn process(&mut self, mut frame: [f32; 2], sample_rate: f32) -> [f32; 2] {
+        for (slot, state) in self.slots.iter().zip(&mut self.states) {
+            if !slot.enabled {
+                continue;
+            }
+            match (slot.kind, state) {
+                (EffectKind::Distortion { drive, mix }, EffectState::Distortion) => {
+                    let normalization = drive.tanh().max(0.001);
+                    for sample in &mut frame {
+                        let wet = (*sample * drive).tanh() / normalization;
+                        *sample += (wet - *sample) * mix;
+                    }
+                }
+                (
+                    EffectKind::Delay { feedback, mix, .. },
+                    EffectState::Delay { buffer, position },
+                ) => {
+                    let delayed = buffer[*position];
+                    buffer[*position] = [
+                        frame[0] + delayed[0] * feedback,
+                        frame[1] + delayed[1] * feedback,
+                    ];
+                    *position = (*position + 1) % buffer.len();
+                    frame[0] += (delayed[0] - frame[0]) * mix;
+                    frame[1] += (delayed[1] - frame[1]) * mix;
+                }
+                (
+                    EffectKind::Chorus {
+                        rate_hz,
+                        depth_ms,
+                        mix,
+                    },
+                    EffectState::Chorus {
+                        buffer,
+                        position,
+                        phase,
+                    },
+                ) => {
+                    let base_delay = sample_rate * 0.018;
+                    let modulation = sample_rate * depth_ms / 1_000.0;
+                    let left_delay = (base_delay + modulation * phase.sin()).max(1.0) as usize;
+                    let right_delay =
+                        (base_delay + modulation * (*phase + 1.7).sin()).max(1.0) as usize;
+                    let left_index = (*position + buffer.len() - left_delay.min(buffer.len() - 1))
+                        % buffer.len();
+                    let right_index = (*position + buffer.len()
+                        - right_delay.min(buffer.len() - 1))
+                        % buffer.len();
+                    let wet = [buffer[left_index][0], buffer[right_index][1]];
+                    buffer[*position] = frame;
+                    *position = (*position + 1) % buffer.len();
+                    *phase = (*phase + std::f32::consts::TAU * rate_hz / sample_rate)
+                        % std::f32::consts::TAU;
+                    frame[0] += (wet[0] - frame[0]) * mix;
+                    frame[1] += (wet[1] - frame[1]) * mix;
+                }
+                (EffectKind::Tremolo { rate_hz, depth }, EffectState::Tremolo { phase }) => {
+                    let gain = 1.0 - depth * 0.5 + phase.sin() * depth * 0.5;
+                    frame[0] *= gain;
+                    frame[1] *= gain;
+                    *phase = (*phase + std::f32::consts::TAU * rate_hz / sample_rate)
+                        % std::f32::consts::TAU;
+                }
+                (
+                    EffectKind::Reverb {
+                        room_size,
+                        damping,
+                        mix,
+                    },
+                    EffectState::Reverb {
+                        left,
+                        right,
+                        left_position,
+                        right_position,
+                        damped,
+                    },
+                ) => {
+                    let wet = [left[*left_position], right[*right_position]];
+                    damped[0] += (wet[0] - damped[0]) * (1.0 - damping);
+                    damped[1] += (wet[1] - damped[1]) * (1.0 - damping);
+                    let feedback = 0.55 + room_size * 0.4;
+                    left[*left_position] = frame[0] + damped[1] * feedback;
+                    right[*right_position] = frame[1] + damped[0] * feedback;
+                    *left_position = (*left_position + 1) % left.len();
+                    *right_position = (*right_position + 1) % right.len();
+                    frame[0] += (wet[0] - frame[0]) * mix;
+                    frame[1] += (wet[1] - frame[1]) * mix;
+                }
+                _ => unreachable!("effect state must match its stack slot"),
+            }
+        }
+        frame
     }
 }
 
@@ -518,10 +699,10 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackPlan, add_panned, export_wav, glide_frequency, held_envelope, note_envelope,
-        pitch_frequency,
+        EffectChain, PlaybackPlan, add_panned, export_wav, glide_frequency, held_envelope,
+        note_envelope, pitch_frequency,
     };
-    use crate::model::{Project, SimpleWaveformSynth, TrackKind};
+    use crate::model::{DEFAULT_EFFECTS, EffectKind, Project, SimpleWaveformSynth, TrackKind};
 
     #[test]
     fn playback_plan_places_and_trims_notes_with_the_clip() {
@@ -537,10 +718,10 @@ mod tests {
 
         let plan = PlaybackPlan::from_project(&project, 100.0);
 
-        assert_eq!(plan.voices.len(), 1);
-        assert_eq!(plan.voices[0].start_sample, 75);
-        assert_eq!(plan.voices[0].note_off_sample, 88);
-        assert!((plan.voices[0].frequency - 440.0).abs() < f32::EPSILON);
+        assert_eq!(plan.channels[0].voices.len(), 1);
+        assert_eq!(plan.channels[0].voices[0].start_sample, 75);
+        assert_eq!(plan.channels[0].voices[0].note_off_sample, 88);
+        assert!((plan.channels[0].voices[0].frequency - 440.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -555,7 +736,7 @@ mod tests {
 
         assert!(
             PlaybackPlan::from_project(&project, 48_000.0)
-                .voices
+                .channels
                 .is_empty()
         );
     }
@@ -616,11 +797,14 @@ mod tests {
 
         let plan = PlaybackPlan::from_project(&project, 48_000.0);
 
-        assert_eq!(plan.voices.len(), 2);
-        assert_eq!(plan.voices[0].note_off_sample, plan.voices[1].start_sample);
+        assert_eq!(plan.channels[0].voices.len(), 2);
         assert_eq!(
-            plan.voices[1].glide_from_frequency,
-            plan.voices[0].frequency
+            plan.channels[0].voices[0].note_off_sample,
+            plan.channels[0].voices[1].start_sample
+        );
+        assert_eq!(
+            plan.channels[0].voices[1].glide_from_frequency,
+            plan.channels[0].voices[0].frequency
         );
     }
 
@@ -665,7 +849,52 @@ mod tests {
 
         let plan = PlaybackPlan::from_project(&project, 48_000.0);
 
-        assert_eq!(plan.voices.len(), 1);
-        assert!((plan.voices[0].frequency - 440.0).abs() < f32::EPSILON);
+        assert_eq!(plan.channels[0].voices.len(), 1);
+        assert!((plan.channels[0].voices[0].frequency - 440.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn delay_emits_audio_after_the_dry_impulse() {
+        let mut slots = DEFAULT_EFFECTS;
+        for slot in &mut slots {
+            slot.enabled = false;
+        }
+        slots[3].enabled = true;
+        slots[3].kind = EffectKind::Delay {
+            time_ms: 1.0,
+            feedback: 0.0,
+            mix: 1.0,
+        };
+        let mut effects = EffectChain::new(slots, 1_000.0);
+
+        assert_eq!(effects.process([1.0, 1.0], 1_000.0), [0.0, 0.0]);
+        assert_eq!(effects.process([0.0, 0.0], 1_000.0), [1.0, 1.0]);
+    }
+
+    #[test]
+    fn changing_effect_order_changes_the_signal() {
+        let mut first_order = DEFAULT_EFFECTS;
+        for slot in &mut first_order {
+            slot.enabled = false;
+        }
+        first_order[0].enabled = true;
+        first_order[0].kind = EffectKind::Distortion {
+            drive: 10.0,
+            mix: 1.0,
+        };
+        first_order[2].enabled = true;
+        first_order[2].kind = EffectKind::Tremolo {
+            rate_hz: 1.0,
+            depth: 1.0,
+        };
+        let mut second_order = first_order;
+        second_order.swap(0, 2);
+        let mut distortion_then_tremolo = EffectChain::new(first_order, 1_000.0);
+        let mut tremolo_then_distortion = EffectChain::new(second_order, 1_000.0);
+
+        let first = distortion_then_tremolo.process([0.8, 0.8], 1_000.0);
+        let second = tremolo_then_distortion.process([0.8, 0.8], 1_000.0);
+
+        assert_ne!(first, second);
     }
 }

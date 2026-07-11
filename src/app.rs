@@ -5,8 +5,8 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     audio::{self, AudioEngine},
     model::{
-        ARRANGEMENT_STEPS, Clip, ClipSourceKind, FilterKind, PATTERN_STEPS, Project, STEPS_PER_BAR,
-        STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
+        ARRANGEMENT_STEPS, Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Project,
+        STEPS_PER_BAR, STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
     },
     piano_roll, project_io,
 };
@@ -1097,6 +1097,105 @@ impl DawApp {
                                 .text("Resonance"),
                         );
                     });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Effects stack");
+                    ui.weak("Signal flows from top to bottom after all voices are mixed.");
+                    let mut reorder = None;
+                    for (index, effect) in synth.effects.iter_mut().enumerate() {
+                        egui::Frame::group(ui.style())
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut effect.enabled, "");
+                                    ui.strong(format!("{}. {}", index + 1, effect.kind.name()));
+                                    if ui.small_button("↑").clicked() && index > 0 {
+                                        reorder = Some((index, index - 1));
+                                    }
+                                    if ui.small_button("↓").clicked() && index + 1 < 5 {
+                                        reorder = Some((index, index + 1));
+                                    }
+                                    if !effect.enabled {
+                                        ui.weak("Bypassed");
+                                    }
+                                });
+                                ui.add_enabled_ui(effect.enabled, |ui| {
+                                    ui.horizontal(|ui| match &mut effect.kind {
+                                        EffectKind::Distortion { drive, mix } => {
+                                            ui.add(
+                                                egui::Slider::new(drive, 1.0..=20.0).text("Drive"),
+                                            );
+                                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                                        }
+                                        EffectKind::Delay {
+                                            time_ms,
+                                            feedback,
+                                            mix,
+                                        } => {
+                                            ui.add(
+                                                egui::Slider::new(time_ms, 10.0..=1_000.0)
+                                                    .text("Time")
+                                                    .suffix(" ms"),
+                                            );
+                                            ui.add(
+                                                egui::Slider::new(feedback, 0.0..=0.9)
+                                                    .text("Feedback"),
+                                            );
+                                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                                        }
+                                        EffectKind::Chorus {
+                                            rate_hz,
+                                            depth_ms,
+                                            mix,
+                                        } => {
+                                            ui.add(
+                                                egui::Slider::new(rate_hz, 0.05..=5.0)
+                                                    .text("Rate")
+                                                    .suffix(" Hz"),
+                                            );
+                                            ui.add(
+                                                egui::Slider::new(depth_ms, 1.0..=30.0)
+                                                    .text("Depth")
+                                                    .suffix(" ms"),
+                                            );
+                                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                                        }
+                                        EffectKind::Tremolo { rate_hz, depth } => {
+                                            ui.add(
+                                                egui::Slider::new(rate_hz, 0.1..=20.0)
+                                                    .text("Rate")
+                                                    .suffix(" Hz"),
+                                            );
+                                            ui.add(
+                                                egui::Slider::new(depth, 0.0..=1.0).text("Depth"),
+                                            );
+                                        }
+                                        EffectKind::Reverb {
+                                            room_size,
+                                            damping,
+                                            mix,
+                                        } => {
+                                            ui.add(
+                                                egui::Slider::new(room_size, 0.0..=1.0)
+                                                    .text("Room"),
+                                            );
+                                            ui.add(
+                                                egui::Slider::new(damping, 0.0..=0.95)
+                                                    .text("Damping"),
+                                            );
+                                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                    if let Some((from, to)) = reorder {
+                        synth.effects.swap(from, to);
+                    }
                 });
         });
     }

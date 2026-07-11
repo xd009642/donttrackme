@@ -22,6 +22,92 @@ pub struct OscillatorLayer {
     pub detune_cents: f32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum EffectKind {
+    Distortion {
+        drive: f32,
+        mix: f32,
+    },
+    Delay {
+        time_ms: f32,
+        feedback: f32,
+        mix: f32,
+    },
+    Chorus {
+        rate_hz: f32,
+        depth_ms: f32,
+        mix: f32,
+    },
+    Tremolo {
+        rate_hz: f32,
+        depth: f32,
+    },
+    Reverb {
+        room_size: f32,
+        damping: f32,
+        mix: f32,
+    },
+}
+
+impl EffectKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Distortion { .. } => "Distortion",
+            Self::Delay { .. } => "Delay",
+            Self::Chorus { .. } => "Chorus",
+            Self::Tremolo { .. } => "Tremolo",
+            Self::Reverb { .. } => "Reverb",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct EffectSlot {
+    pub enabled: bool,
+    pub kind: EffectKind,
+}
+
+pub const DEFAULT_EFFECTS: [EffectSlot; 5] = [
+    EffectSlot {
+        enabled: false,
+        kind: EffectKind::Distortion {
+            drive: 2.5,
+            mix: 0.5,
+        },
+    },
+    EffectSlot {
+        enabled: false,
+        kind: EffectKind::Chorus {
+            rate_hz: 0.8,
+            depth_ms: 8.0,
+            mix: 0.35,
+        },
+    },
+    EffectSlot {
+        enabled: false,
+        kind: EffectKind::Tremolo {
+            rate_hz: 4.0,
+            depth: 0.5,
+        },
+    },
+    EffectSlot {
+        enabled: false,
+        kind: EffectKind::Delay {
+            time_ms: 280.0,
+            feedback: 0.35,
+            mix: 0.3,
+        },
+    },
+    EffectSlot {
+        enabled: false,
+        kind: EffectKind::Reverb {
+            room_size: 0.6,
+            damping: 0.45,
+            mix: 0.3,
+        },
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterKind {
     Off,
@@ -59,6 +145,7 @@ pub struct SimpleWaveformSynth {
     pub filter: FilterKind,
     pub filter_cutoff_hz: f32,
     pub filter_resonance: f32,
+    pub effects: [EffectSlot; 5],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +176,7 @@ impl Default for SimpleWaveformSynth {
             filter: FilterKind::Off,
             filter_cutoff_hz: 8_000.0,
             filter_resonance: 0.1,
+            effects: DEFAULT_EFFECTS,
         }
     }
 }
@@ -143,6 +231,7 @@ macro_rules! preset {
                 filter: $filter,
                 filter_cutoff_hz: $cutoff,
                 filter_resonance: 0.15,
+                effects: DEFAULT_EFFECTS,
             },
         }
     }};
