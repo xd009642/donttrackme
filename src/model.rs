@@ -159,6 +159,7 @@ pub struct SynthPreset {
 pub struct SampleSynth {
     pub path: Option<PathBuf>,
     pub root_pitch: u8,
+    pub regions: Vec<SampleRegion>,
     pub trim_start: f32,
     pub trim_end: f32,
     pub speed: f32,
@@ -172,6 +173,14 @@ pub struct SampleSynth {
     pub filter: FilterKind,
     pub filter_cutoff_hz: f32,
     pub filter_resonance: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleRegion {
+    pub path: PathBuf,
+    pub root_pitch: u8,
+    pub velocity_min: u8,
+    pub velocity_max: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +203,7 @@ impl Default for SampleSynth {
         Self {
             path: None,
             root_pitch: 60,
+            regions: Vec::new(),
             trim_start: 0.0,
             trim_end: 1.0,
             speed: 1.0,

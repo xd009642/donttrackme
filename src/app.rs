@@ -10,8 +10,8 @@ use crate::{
     audio::{self, AudioEngine},
     model::{
         ARRANGEMENT_STEPS, Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Project,
-        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SimpleWaveformSynth, TrackKind, Waveform,
-        noise_sample,
+        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SampleRegion, SimpleWaveformSynth,
+        TrackKind, Waveform, noise_sample,
     },
     piano_roll, project_io,
 };
@@ -1536,6 +1536,27 @@ impl DawApp {
                             sampler.path = Some(path);
                             sampler.trim_start = 0.0;
                             sampler.trim_end = 1.0;
+                            sampler.regions.clear();
+                        }
+                        if ui.button("Import Iowa instrument").clicked()
+                            && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                        {
+                            match discover_iowa_regions(&folder) {
+                                Ok(regions) if !regions.is_empty() => {
+                                    sampler.path = Some(regions[0].path.clone());
+                                    sampler.root_pitch = regions[0].root_pitch;
+                                    sampler.regions = regions;
+                                    sampler.trim_start = 0.0;
+                                    sampler.trim_end = 1.0;
+                                }
+                                Ok(_) => {
+                                    self.audio_error = Some(
+                                        "No pitch-named WAV files were found in that folder"
+                                            .to_owned(),
+                                    );
+                                }
+                                Err(error) => self.audio_error = Some(error),
+                            }
                         }
                         ui.label(
                             sampler
@@ -1546,6 +1567,11 @@ impl DawApp {
                                 .unwrap_or("No sample loaded"),
                         );
                     });
+                    if !sampler.regions.is_empty() {
+                        ui.label(format!("{} mapped sample regions", sampler.regions.len()));
+                        // TODO: Split Iowa folders into selectable articulation presets instead of
+                        // combining arco, pizzicato, vibrato, and other techniques in one map.
+                    }
                     ui.add_space(8.0);
                     sample_waveform_editor(ui, &self.sampler_waveform, sampler, &mut trim_drag);
                     ui.weak("Click or drag near a marker to set the sample start or end point.");
@@ -1761,6 +1787,80 @@ fn sample_waveform_editor(
     }
 }
 
+fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, String> {
+    let mut pending = vec![folder.to_owned()];
+    let mut regions = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("Could not read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Could not read an entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("wav") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let parts = stem.split('.').collect::<Vec<_>>();
+            let Some(root_pitch) = parts.iter().rev().find_map(|part| parse_note_pitch(part))
+            else {
+                continue;
+            };
+            let (velocity_min, velocity_max) = if parts.contains(&"pp") {
+                (1, 42)
+            } else if parts.contains(&"mf") {
+                (43, 84)
+            } else if parts.contains(&"ff") {
+                (85, 127)
+            } else {
+                (1, 127)
+            };
+            regions.push(SampleRegion {
+                path,
+                root_pitch,
+                velocity_min,
+                velocity_max,
+            });
+        }
+    }
+    regions.sort_by_key(|region| (region.root_pitch, region.velocity_min));
+    Ok(regions)
+}
+
+fn parse_note_pitch(value: &str) -> Option<u8> {
+    let mut characters = value.chars();
+    let semitone = match characters.next()? {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let remainder = characters.as_str();
+    let (accidental, octave) = if let Some(octave) = remainder.strip_prefix('b') {
+        (-1, octave)
+    } else if let Some(octave) = remainder.strip_prefix('#') {
+        (1, octave)
+    } else {
+        (0, remainder)
+    };
+    let octave = octave.parse::<i16>().ok()?;
+    u8::try_from((octave + 1) * 12 + semitone + accidental).ok()
+}
+
 #[derive(Default)]
 struct SynthKeyboardOutput {
     note_on: Option<u8>,
@@ -1957,7 +2057,7 @@ impl eframe::App for DawApp {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{PIANO_KEYS, TapTempo};
+    use super::{PIANO_KEYS, TapTempo, parse_note_pitch};
     use eframe::egui::Key;
 
     #[test]
@@ -1991,5 +2091,13 @@ mod tests {
         assert!((bpm - 120.0).abs() < f32::EPSILON);
         assert_eq!(tap.record(start + Duration::from_secs(5)), None);
         assert_eq!(tap.taps.len(), 1);
+    }
+
+    #[test]
+    fn iowa_note_names_map_to_midi_pitches() {
+        assert_eq!(parse_note_pitch("C4"), Some(60));
+        assert_eq!(parse_note_pitch("Bb3"), Some(58));
+        assert_eq!(parse_note_pitch("F#5"), Some(78));
+        assert_eq!(parse_note_pitch("stereo"), None);
     }
 }

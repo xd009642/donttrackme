@@ -32,6 +32,7 @@ enum Command {
     },
     AuditionSampleStart {
         pitch: u8,
+        root_pitch: u8,
         sampler: SampleSynth,
         sample: Arc<SampleBuffer>,
     },
@@ -50,10 +51,7 @@ struct ChannelPlan {
 
 enum RenderInstrument {
     Synth(SimpleWaveformSynth),
-    Sampler {
-        sampler: SampleSynth,
-        sample: Arc<SampleBuffer>,
-    },
+    Sampler { sampler: SampleSynth },
 }
 
 struct SampleBuffer {
@@ -68,6 +66,7 @@ struct Voice {
     glide_from_frequency: f32,
     gain: f32,
     filter: FilterState,
+    sample: Option<Arc<SampleBuffer>>,
 }
 
 #[derive(Default)]
@@ -201,7 +200,7 @@ impl AudioEngine {
     }
 
     pub fn audition_sample_start(&self, pitch: u8, sampler: SampleSynth) -> Result<(), String> {
-        let Some(path) = &sampler.path else {
+        let Some((path, root_pitch)) = select_sample_region(&sampler, pitch, 127) else {
             return Err("Load a WAV into the sampler first".to_owned());
         };
         let mut cache = self
@@ -212,12 +211,13 @@ impl AudioEngine {
             Arc::clone(sample)
         } else {
             let sample = Arc::new(load_wav(path)?);
-            cache.insert(path.clone(), Arc::clone(&sample));
+            cache.insert(path.to_owned(), Arc::clone(&sample));
             sample
         };
         self.commands
             .send(Command::AuditionSampleStart {
                 pitch,
+                root_pitch,
                 sampler,
                 sample,
             })
@@ -267,12 +267,11 @@ impl PlaybackPlan {
             let instrument = match &channel.kind {
                 TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
                 TrackKind::Sampler { sampler } => {
-                    let Some(path) = &sampler.path else {
+                    if sampler.path.is_none() && sampler.regions.is_empty() {
                         continue;
-                    };
+                    }
                     RenderInstrument::Sampler {
                         sampler: sampler.clone(),
-                        sample: Arc::new(load_wav(path)?),
                     }
                 }
                 TrackKind::Sample => continue,
@@ -303,11 +302,24 @@ impl PlaybackPlan {
                             RenderInstrument::Synth(synth) => {
                                 pitch_frequency(note.pitch, synth.pitch_shift)
                             }
-                            RenderInstrument::Sampler { sampler, .. } => {
-                                2.0_f32.powf(
-                                    (f32::from(note.pitch) - f32::from(sampler.root_pitch)) / 12.0,
-                                ) * sampler.speed
+                            RenderInstrument::Sampler { sampler } => {
+                                let (_, root_pitch) =
+                                    select_sample_region(sampler, note.pitch, note.velocity)
+                                        .expect("loaded sampler has at least one sample region");
+                                2.0_f32.powf((f32::from(note.pitch) - f32::from(root_pitch)) / 12.0)
+                                    * sampler.speed
                             }
+                        };
+                        let sample = match &instrument {
+                            RenderInstrument::Sampler { sampler } => {
+                                let (path, _) =
+                                    select_sample_region(sampler, note.pitch, note.velocity)
+                                        .expect("loaded sampler has at least one sample region");
+                                // TODO: Cache decoded buffers while constructing the plan;
+                                // multisampled chords currently decode duplicate source files.
+                                Some(Arc::new(load_wav(path)?))
+                            }
+                            RenderInstrument::Synth(_) => None,
                         };
                         channel_voices.push(Voice {
                             start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
@@ -317,6 +329,7 @@ impl PlaybackPlan {
                             glide_from_frequency: frequency,
                             gain: f32::from(note.velocity) / 127.0,
                             filter: FilterState::default(),
+                            sample,
                         });
                     }
                 }
@@ -372,13 +385,11 @@ impl PlaybackPlan {
         let instrument = match &channel.kind {
             TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
             TrackKind::Sampler { sampler } => {
-                let path = sampler
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| "Load a WAV into the sampler first".to_owned())?;
+                if sampler.path.is_none() && sampler.regions.is_empty() {
+                    return Err("Load a WAV into the sampler first".to_owned());
+                }
                 RenderInstrument::Sampler {
                     sampler: sampler.clone(),
-                    sample: Arc::new(load_wav(path)?),
                 }
             }
             TrackKind::Sample => return Err("Sample tracks do not have patterns".to_owned()),
@@ -387,17 +398,30 @@ impl PlaybackPlan {
         let mut voices = pattern
             .notes
             .iter()
-            .map(|note| {
+            .map(|note| -> Result<Voice, String> {
                 let frequency = match &instrument {
                     RenderInstrument::Synth(synth) => {
                         pitch_frequency(note.pitch, synth.pitch_shift)
                     }
-                    RenderInstrument::Sampler { sampler, .. } => {
-                        2.0_f32.powf((f32::from(note.pitch) - f32::from(sampler.root_pitch)) / 12.0)
+                    RenderInstrument::Sampler { sampler } => {
+                        let (_, root_pitch) =
+                            select_sample_region(sampler, note.pitch, note.velocity)
+                                .expect("loaded sampler has at least one sample region");
+                        2.0_f32.powf((f32::from(note.pitch) - f32::from(root_pitch)) / 12.0)
                             * sampler.speed
                     }
                 };
-                Voice {
+                let sample = match &instrument {
+                    RenderInstrument::Sampler { sampler } => {
+                        let (path, _) = select_sample_region(sampler, note.pitch, note.velocity)
+                            .expect("loaded sampler has at least one sample region");
+                        // TODO: Cache decoded buffers while constructing the plan; multisampled
+                        // chords currently decode duplicate source files.
+                        Some(Arc::new(load_wav(path)?))
+                    }
+                    RenderInstrument::Synth(_) => None,
+                };
+                Ok(Voice {
                     start_sample: (f32::from(note.start_step) * samples_per_step).round() as u64,
                     note_off_sample: (f32::from(note.start_step + note.length_steps)
                         * samples_per_step)
@@ -406,9 +430,10 @@ impl PlaybackPlan {
                     glide_from_frequency: frequency,
                     gain: f32::from(note.velocity) / 127.0,
                     filter: FilterState::default(),
-                }
+                    sample,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         voices.sort_by_key(|voice| voice.start_sample);
         if matches!(&instrument, RenderInstrument::Synth(synth) if synth.mono) {
             for index in 1..voices.len() {
@@ -556,11 +581,12 @@ impl Renderer {
                 }
                 Command::AuditionSampleStart {
                     pitch,
+                    root_pitch,
                     sampler,
                     sample,
                 } => {
                     let playback_rate = 2.0_f32
-                        .powf((f32::from(pitch) - f32::from(sampler.root_pitch)) / 12.0)
+                        .powf((f32::from(pitch) - f32::from(root_pitch)) / 12.0)
                         * sampler.speed;
                     self.audition_samples.retain(|voice| voice.pitch != pitch);
                     self.audition_samples.push(AuditionSampleVoice {
@@ -649,7 +675,7 @@ impl Renderer {
                             add_panned(&mut channel_output, filtered, synth.pan);
                         }
                     }
-                    RenderInstrument::Sampler { sampler, sample } => {
+                    RenderInstrument::Sampler { sampler } => {
                         for voice in &mut channel.voices {
                             if self.position < voice.start_sample {
                                 continue;
@@ -671,6 +697,10 @@ impl Renderer {
                             } else {
                                 0.0
                             };
+                            let sample = voice
+                                .sample
+                                .as_ref()
+                                .expect("sampler voices carry their selected sample");
                             let Some(frame) = sampler_frame(
                                 sample,
                                 sampler,
@@ -1012,6 +1042,27 @@ fn oscillator_sample(
         / f32::from(synth.layer_count)
 }
 
+fn select_sample_region(sampler: &SampleSynth, pitch: u8, velocity: u8) -> Option<(&Path, u8)> {
+    let matching_velocity = sampler
+        .regions
+        .iter()
+        .filter(|region| (region.velocity_min..=region.velocity_max).contains(&velocity));
+    if let Some(region) = matching_velocity.min_by_key(|region| region.root_pitch.abs_diff(pitch)) {
+        return Some((&region.path, region.root_pitch));
+    }
+    sampler
+        .regions
+        .iter()
+        .min_by_key(|region| region.root_pitch.abs_diff(pitch))
+        .map(|region| (region.path.as_path(), region.root_pitch))
+        .or_else(|| {
+            sampler
+                .path
+                .as_deref()
+                .map(|path| (path, sampler.root_pitch))
+        })
+}
+
 fn sampler_frame(
     sample: &SampleBuffer,
     sampler: &SampleSynth,
@@ -1156,8 +1207,45 @@ mod tests {
     use super::{
         EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
         glide_frequency, held_envelope, note_envelope, pitch_frequency, sampler_frame,
+        select_sample_region,
     };
-    use crate::model::{DEFAULT_EFFECTS, EffectKind, Project, SimpleWaveformSynth, TrackKind};
+    use crate::model::{
+        DEFAULT_EFFECTS, EffectKind, Project, SampleRegion, SampleSynth, SimpleWaveformSynth,
+        TrackKind,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn multisampler_selects_velocity_layer_then_nearest_root() {
+        let sampler = SampleSynth {
+            regions: vec![
+                SampleRegion {
+                    path: PathBuf::from("soft-c4.wav"),
+                    root_pitch: 60,
+                    velocity_min: 1,
+                    velocity_max: 84,
+                },
+                SampleRegion {
+                    path: PathBuf::from("loud-c4.wav"),
+                    root_pitch: 60,
+                    velocity_min: 85,
+                    velocity_max: 127,
+                },
+                SampleRegion {
+                    path: PathBuf::from("loud-g4.wav"),
+                    root_pitch: 67,
+                    velocity_min: 85,
+                    velocity_max: 127,
+                },
+            ],
+            ..SampleSynth::default()
+        };
+
+        let (path, root) = select_sample_region(&sampler, 65, 100)
+            .expect("a matching multisample region should exist");
+        assert_eq!(path, std::path::Path::new("loud-g4.wav"));
+        assert_eq!(root, 67);
+    }
 
     #[test]
     fn playback_plan_places_and_trims_notes_with_the_clip() {
