@@ -1,6 +1,11 @@
 use std::{
+    collections::HashMap,
     path::Path,
-    sync::mpsc::{self, Receiver, Sender},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
 };
 
 use cpal::{
@@ -9,8 +14,8 @@ use cpal::{
 };
 
 use crate::model::{
-    ARRANGEMENT_STEPS, EffectKind, EffectSlot, FilterKind, Project, STEPS_PER_BEAT,
-    SimpleWaveformSynth, TrackKind, noise_sample,
+    ARRANGEMENT_STEPS, DEFAULT_EFFECTS, EffectKind, EffectSlot, FilterKind, Project,
+    STEPS_PER_BEAT, SampleSynth, SimpleWaveformSynth, TrackKind, noise_sample,
 };
 
 enum Command {
@@ -23,6 +28,11 @@ enum Command {
     AuditionStop {
         pitch: u8,
     },
+    AuditionSampleStart {
+        pitch: u8,
+        sampler: SampleSynth,
+        sample: Arc<SampleBuffer>,
+    },
 }
 
 struct PlaybackPlan {
@@ -31,9 +41,22 @@ struct PlaybackPlan {
 }
 
 struct ChannelPlan {
-    synth: SimpleWaveformSynth,
+    instrument: RenderInstrument,
     voices: Vec<Voice>,
     effects: EffectChain,
+}
+
+enum RenderInstrument {
+    Synth(SimpleWaveformSynth),
+    Sampler {
+        sampler: SampleSynth,
+        sample: Arc<SampleBuffer>,
+    },
+}
+
+struct SampleBuffer {
+    frames: Vec<[f32; 2]>,
+    sample_rate: f32,
 }
 
 struct Voice {
@@ -83,6 +106,7 @@ pub struct AudioEngine {
     _stream: Stream,
     commands: Sender<Command>,
     sample_rate: f32,
+    sample_cache: Mutex<HashMap<PathBuf, Arc<SampleBuffer>>>,
 }
 
 impl AudioEngine {
@@ -121,6 +145,7 @@ impl AudioEngine {
             _stream: stream,
             commands,
             sample_rate,
+            sample_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -129,7 +154,7 @@ impl AudioEngine {
             .send(Command::Play(PlaybackPlan::from_project(
                 project,
                 self.sample_rate,
-            )))
+            )?))
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
@@ -150,11 +175,35 @@ impl AudioEngine {
             .send(Command::AuditionStop { pitch })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
+
+    pub fn audition_sample_start(&self, pitch: u8, sampler: SampleSynth) -> Result<(), String> {
+        let Some(path) = &sampler.path else {
+            return Err("Load a WAV into the sampler first".to_owned());
+        };
+        let mut cache = self
+            .sample_cache
+            .lock()
+            .map_err(|_| "The sample cache is unavailable".to_owned())?;
+        let sample = if let Some(sample) = cache.get(path) {
+            Arc::clone(sample)
+        } else {
+            let sample = Arc::new(load_wav(path)?);
+            cache.insert(path.clone(), Arc::clone(&sample));
+            sample
+        };
+        self.commands
+            .send(Command::AuditionSampleStart {
+                pitch,
+                sampler,
+                sample,
+            })
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
 }
 
 pub fn export_wav(project: &Project, path: &Path) -> Result<(), String> {
     const SAMPLE_RATE: u32 = 44_100;
-    let plan = PlaybackPlan::from_project(project, SAMPLE_RATE as f32);
+    let plan = PlaybackPlan::from_project(project, SAMPLE_RATE as f32)?;
     let frame_count = plan.loop_samples;
     let (_sender, receiver) = mpsc::channel();
     let mut renderer = Renderer::new(receiver, SAMPLE_RATE as f32);
@@ -182,7 +231,7 @@ pub fn export_wav(project: &Project, path: &Path) -> Result<(), String> {
 }
 
 impl PlaybackPlan {
-    fn from_project(project: &Project, sample_rate: f32) -> Self {
+    fn from_project(project: &Project, sample_rate: f32) -> Result<Self, String> {
         let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
         let any_solo = project.tracks.iter().any(|track| track.solo);
         let mut channels = Vec::new();
@@ -191,8 +240,18 @@ impl PlaybackPlan {
             if channel.muted || (any_solo && !channel.solo) {
                 continue;
             }
-            let TrackKind::Instrument { synth } = channel.kind else {
-                continue;
+            let instrument = match &channel.kind {
+                TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
+                TrackKind::Sampler { sampler } => {
+                    let Some(path) = &sampler.path else {
+                        continue;
+                    };
+                    RenderInstrument::Sampler {
+                        sampler: sampler.clone(),
+                        sample: Arc::new(load_wav(path)?),
+                    }
+                }
+                TrackKind::Sample => continue,
             };
             let mut channel_voices = Vec::new();
             for lane in project.tracks.iter().filter(|lane| !lane.muted) {
@@ -216,7 +275,16 @@ impl PlaybackPlan {
                         }
                         let end_step = clip.start_step
                             + (note.start_step + note.length_steps).min(clip.length_steps);
-                        let frequency = pitch_frequency(note.pitch, synth.pitch_shift);
+                        let frequency = match &instrument {
+                            RenderInstrument::Synth(synth) => {
+                                pitch_frequency(note.pitch, synth.pitch_shift)
+                            }
+                            RenderInstrument::Sampler { sampler, .. } => {
+                                2.0_f32.powf(
+                                    (f32::from(note.pitch) - f32::from(sampler.root_pitch)) / 12.0,
+                                ) * sampler.speed
+                            }
+                        };
                         channel_voices.push(Voice {
                             start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
                             note_off_sample: (f32::from(end_step) * samples_per_step).round()
@@ -230,7 +298,7 @@ impl PlaybackPlan {
                 }
             }
             channel_voices.sort_by_key(|voice| voice.start_sample);
-            if synth.mono {
+            if matches!(&instrument, RenderInstrument::Synth(synth) if synth.mono) {
                 for index in 0..channel_voices.len() {
                     if index > 0 {
                         channel_voices[index].glide_from_frequency =
@@ -245,17 +313,24 @@ impl PlaybackPlan {
             }
             if !channel_voices.is_empty() {
                 channels.push(ChannelPlan {
-                    synth,
+                    effects: match &instrument {
+                        RenderInstrument::Synth(synth) => {
+                            EffectChain::new(synth.effects, sample_rate)
+                        }
+                        RenderInstrument::Sampler { .. } => {
+                            EffectChain::new(DEFAULT_EFFECTS, sample_rate)
+                        }
+                    },
+                    instrument,
                     voices: channel_voices,
-                    effects: EffectChain::new(synth.effects, sample_rate),
                 });
             }
         }
 
-        Self {
+        Ok(Self {
             channels,
             loop_samples: (f32::from(ARRANGEMENT_STEPS) * samples_per_step).round() as u64,
-        }
+        })
     }
 }
 
@@ -286,6 +361,7 @@ struct Renderer {
     sample_rate: f32,
     audition_voices: Vec<AuditionVoice>,
     audition_effects: Option<EffectChain>,
+    audition_samples: Vec<AuditionSampleVoice>,
 }
 
 struct AuditionVoice {
@@ -299,6 +375,17 @@ struct AuditionVoice {
     filter: FilterState,
 }
 
+struct AuditionSampleVoice {
+    pitch: u8,
+    sampler: SampleSynth,
+    sample: Arc<SampleBuffer>,
+    playback_rate: f32,
+    elapsed: u64,
+    released_at: Option<u64>,
+    filter: FilterState,
+    finished: bool,
+}
+
 impl Renderer {
     fn new(receiver: Receiver<Command>, sample_rate: f32) -> Self {
         Self {
@@ -308,6 +395,7 @@ impl Renderer {
             sample_rate,
             audition_voices: Vec::with_capacity(40),
             audition_effects: None,
+            audition_samples: Vec::with_capacity(40),
         }
     }
 
@@ -349,6 +437,33 @@ impl Renderer {
                         let level = held_envelope(&voice.synth, voice.elapsed, self.sample_rate);
                         voice.released_at = Some((voice.elapsed, level));
                     }
+                    for voice in self
+                        .audition_samples
+                        .iter_mut()
+                        .filter(|voice| voice.pitch == pitch && voice.released_at.is_none())
+                    {
+                        voice.released_at = Some(voice.elapsed);
+                    }
+                }
+                Command::AuditionSampleStart {
+                    pitch,
+                    sampler,
+                    sample,
+                } => {
+                    let playback_rate = 2.0_f32
+                        .powf((f32::from(pitch) - f32::from(sampler.root_pitch)) / 12.0)
+                        * sampler.speed;
+                    self.audition_samples.retain(|voice| voice.pitch != pitch);
+                    self.audition_samples.push(AuditionSampleVoice {
+                        pitch,
+                        sampler,
+                        sample,
+                        playback_rate,
+                        elapsed: 0,
+                        released_at: None,
+                        filter: FilterState::default(),
+                        finished: false,
+                    });
                 }
             }
         }
@@ -394,31 +509,78 @@ impl Renderer {
         if let Some(plan) = &mut self.plan {
             for channel in &mut plan.channels {
                 let mut channel_output = [0.0, 0.0];
-                for voice in &mut channel.voices {
-                    if self.position < voice.start_sample {
-                        continue;
+                match &mut channel.instrument {
+                    RenderInstrument::Synth(synth) => {
+                        for voice in &mut channel.voices {
+                            if self.position < voice.start_sample {
+                                continue;
+                            }
+                            let elapsed = self.position - voice.start_sample;
+                            let release_samples = ms_samples(synth.release_ms, self.sample_rate);
+                            if self.position >= voice.note_off_sample + release_samples {
+                                continue;
+                            }
+                            let note_length = voice.note_off_sample - voice.start_sample;
+                            let envelope =
+                                note_envelope(synth, elapsed, note_length, self.sample_rate);
+                            let frequency = glide_frequency(
+                                voice.glide_from_frequency,
+                                voice.frequency,
+                                elapsed,
+                                ms_samples(synth.glide_ms, self.sample_rate),
+                            );
+                            let raw =
+                                oscillator_sample(synth, elapsed, frequency, self.sample_rate)
+                                    * envelope
+                                    * voice.gain
+                                    * synth.master_level;
+                            let filtered = voice.filter.process(raw, synth, self.sample_rate);
+                            add_panned(&mut channel_output, filtered, synth.pan);
+                        }
                     }
-                    let elapsed = self.position - voice.start_sample;
-                    let release_samples = ms_samples(channel.synth.release_ms, self.sample_rate);
-                    if self.position >= voice.note_off_sample + release_samples {
-                        continue;
+                    RenderInstrument::Sampler { sampler, sample } => {
+                        for voice in &mut channel.voices {
+                            if self.position < voice.start_sample {
+                                continue;
+                            }
+                            let elapsed = self.position - voice.start_sample;
+                            let note_length = voice.note_off_sample - voice.start_sample;
+                            let release = ms_samples(sampler.release_ms, self.sample_rate);
+                            if elapsed >= note_length + release {
+                                continue;
+                            }
+                            let attack = ms_samples(sampler.attack_ms, self.sample_rate);
+                            let envelope = if elapsed < attack && attack > 0 {
+                                elapsed as f32 / attack as f32
+                            } else if elapsed < note_length {
+                                1.0
+                            } else if release > 0 {
+                                (1.0 - (elapsed - note_length) as f32 / release as f32)
+                                    .clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let Some(frame) = sampler_frame(
+                                sample,
+                                sampler,
+                                elapsed,
+                                voice.frequency,
+                                self.sample_rate,
+                            ) else {
+                                continue;
+                            };
+                            let mono =
+                                (frame[0] + frame[1]) * 0.5 * envelope * sampler.gain * voice.gain;
+                            let filtered = voice.filter.process_values(
+                                mono,
+                                sampler.filter,
+                                sampler.filter_cutoff_hz,
+                                sampler.filter_resonance,
+                                self.sample_rate,
+                            );
+                            add_panned(&mut channel_output, filtered, sampler.pan);
+                        }
                     }
-                    let note_length = voice.note_off_sample - voice.start_sample;
-                    let envelope =
-                        note_envelope(&channel.synth, elapsed, note_length, self.sample_rate);
-                    let frequency = glide_frequency(
-                        voice.glide_from_frequency,
-                        voice.frequency,
-                        elapsed,
-                        ms_samples(channel.synth.glide_ms, self.sample_rate),
-                    );
-                    let raw =
-                        oscillator_sample(&channel.synth, elapsed, frequency, self.sample_rate)
-                            * envelope
-                            * voice.gain
-                            * channel.synth.master_level;
-                    let filtered = voice.filter.process(raw, &channel.synth, self.sample_rate);
-                    add_panned(&mut channel_output, filtered, channel.synth.pan);
                 }
                 let effected = channel.effects.process(channel_output, self.sample_rate);
                 output[0] += effected[0];
@@ -474,6 +636,54 @@ impl Renderer {
             output[0] += effected[0];
             output[1] += effected[1];
         }
+        for voice in &mut self.audition_samples {
+            let envelope = match voice.released_at {
+                Some(released_at) => {
+                    let release = ms_samples(voice.sampler.release_ms, self.sample_rate);
+                    if release == 0 {
+                        0.0
+                    } else {
+                        (1.0 - (voice.elapsed - released_at) as f32 / release as f32)
+                            .clamp(0.0, 1.0)
+                    }
+                }
+                None => {
+                    let attack = ms_samples(voice.sampler.attack_ms, self.sample_rate);
+                    if voice.elapsed < attack && attack > 0 {
+                        voice.elapsed as f32 / attack as f32
+                    } else {
+                        1.0
+                    }
+                }
+            };
+            let Some(frame) = sampler_frame(
+                &voice.sample,
+                &voice.sampler,
+                voice.elapsed,
+                voice.playback_rate,
+                self.sample_rate,
+            ) else {
+                voice.finished = true;
+                continue;
+            };
+            let mono = (frame[0] + frame[1]) * 0.5 * envelope * voice.sampler.gain;
+            let filtered = voice.filter.process_values(
+                mono,
+                voice.sampler.filter,
+                voice.sampler.filter_cutoff_hz,
+                voice.sampler.filter_resonance,
+                self.sample_rate,
+            );
+            add_panned(&mut output, filtered, voice.sampler.pan);
+            voice.elapsed += 1;
+        }
+        self.audition_samples.retain(|voice| {
+            !voice.finished
+                && voice.released_at.is_none_or(|released_at| {
+                    voice.elapsed
+                        < released_at + ms_samples(voice.sampler.release_ms, self.sample_rate)
+                })
+        });
 
         [output[0].tanh(), output[1].tanh()]
     }
@@ -481,16 +691,33 @@ impl Renderer {
 
 impl FilterState {
     fn process(&mut self, input: f32, synth: &SimpleWaveformSynth, sample_rate: f32) -> f32 {
-        if synth.filter == FilterKind::Off {
+        self.process_values(
+            input,
+            synth.filter,
+            synth.filter_cutoff_hz,
+            synth.filter_resonance,
+            sample_rate,
+        )
+    }
+
+    fn process_values(
+        &mut self,
+        input: f32,
+        kind: FilterKind,
+        cutoff_hz: f32,
+        resonance: f32,
+        sample_rate: f32,
+    ) -> f32 {
+        if kind == FilterKind::Off {
             return input;
         }
-        let cutoff = synth.filter_cutoff_hz.clamp(20.0, sample_rate * 0.45);
+        let cutoff = cutoff_hz.clamp(20.0, sample_rate * 0.45);
         let frequency = ((std::f32::consts::PI * cutoff / sample_rate).sin() * 2.0).min(0.99);
-        let damping = (2.0 * (1.0 - synth.filter_resonance.powf(0.25))).clamp(0.05, 2.0);
+        let damping = (2.0 * (1.0 - resonance.powf(0.25))).clamp(0.05, 2.0);
         self.low += frequency * self.band;
         let high = input - self.low - damping * self.band;
         self.band += frequency * high;
-        match synth.filter {
+        match kind {
             FilterKind::Off => input,
             FilterKind::LowPass => self.low,
             FilterKind::HighPass => high,
@@ -674,6 +901,85 @@ fn oscillator_sample(
         / f32::from(synth.layer_count)
 }
 
+fn sampler_frame(
+    sample: &SampleBuffer,
+    sampler: &SampleSynth,
+    elapsed: u64,
+    playback_rate: f32,
+    output_sample_rate: f32,
+) -> Option<[f32; 2]> {
+    if sample.frames.is_empty() {
+        return None;
+    }
+    let frame_count = sample.frames.len();
+    let start = (sampler.trim_start.clamp(0.0, 1.0) * frame_count as f32).floor() as usize;
+    let end = (sampler.trim_end.clamp(0.0, 1.0) * frame_count as f32)
+        .ceil()
+        .clamp(1.0, frame_count as f32) as usize;
+    if start >= end {
+        return None;
+    }
+    let position = elapsed as f32 * playback_rate * sample.sample_rate / output_sample_rate;
+    if position >= (end - start) as f32 {
+        return None;
+    }
+    let source_position = if sampler.reverse {
+        end as f32 - 1.0 - position
+    } else {
+        start as f32 + position
+    };
+    let first = source_position.floor() as usize;
+    let second = if sampler.reverse {
+        first.saturating_sub(1).max(start)
+    } else {
+        (first + 1).min(end - 1)
+    };
+    let fraction = source_position.fract();
+    Some([
+        sample.frames[first][0] + (sample.frames[second][0] - sample.frames[first][0]) * fraction,
+        sample.frames[first][1] + (sample.frames[second][1] - sample.frames[first][1]) * fraction,
+    ])
+}
+
+fn load_wav(path: &Path) -> Result<SampleBuffer, String> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|error| format!("Could not open sample {}: {error}", path.display()))?;
+    let specification = reader.spec();
+    let channels = usize::from(specification.channels);
+    if channels == 0 {
+        return Err("The WAV file has no audio channels".to_owned());
+    }
+    let samples = match specification.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|sample| sample.map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?,
+        hound::SampleFormat::Int => {
+            let maximum = ((1_u64 << (specification.bits_per_sample - 1)) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| {
+                    sample
+                        .map(|value| value as f32 / maximum)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    let frames = samples
+        .chunks(channels)
+        .map(|frame| {
+            let left = frame[0];
+            let right = frame.get(1).copied().unwrap_or(left);
+            [left, right]
+        })
+        .collect();
+    Ok(SampleBuffer {
+        frames,
+        sample_rate: specification.sample_rate as f32,
+    })
+}
+
 fn pitch_frequency(pitch: u8, shift: i8) -> f32 {
     440.0 * 2.0_f32.powf((f32::from(pitch) + f32::from(shift) - 69.0) / 12.0)
 }
@@ -699,8 +1005,8 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectChain, PlaybackPlan, add_panned, export_wav, glide_frequency, held_envelope,
-        note_envelope, pitch_frequency,
+        EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
+        glide_frequency, held_envelope, note_envelope, pitch_frequency, sampler_frame,
     };
     use crate::model::{DEFAULT_EFFECTS, EffectKind, Project, SimpleWaveformSynth, TrackKind};
 
@@ -716,7 +1022,8 @@ mod tests {
         project.tracks[0].clips[0].start_step = 4;
         project.tracks[0].clips[0].length_steps = 3;
 
-        let plan = PlaybackPlan::from_project(&project, 100.0);
+        let plan = PlaybackPlan::from_project(&project, 100.0)
+            .expect("synth project should build a playback plan");
 
         assert_eq!(plan.channels[0].voices.len(), 1);
         assert_eq!(plan.channels[0].voices[0].start_sample, 75);
@@ -736,6 +1043,7 @@ mod tests {
 
         assert!(
             PlaybackPlan::from_project(&project, 48_000.0)
+                .expect("synth project should build a playback plan")
                 .channels
                 .is_empty()
         );
@@ -795,7 +1103,8 @@ mod tests {
             .expect("primary pattern should exist");
         project.ensure_primary_pattern_clip(channel_id);
 
-        let plan = PlaybackPlan::from_project(&project, 48_000.0);
+        let plan = PlaybackPlan::from_project(&project, 48_000.0)
+            .expect("synth project should build a playback plan");
 
         assert_eq!(plan.channels[0].voices.len(), 2);
         assert_eq!(
@@ -847,7 +1156,8 @@ mod tests {
             .expect("new lane should exist")
             .add_clip(source_id, 0, 8);
 
-        let plan = PlaybackPlan::from_project(&project, 48_000.0);
+        let plan = PlaybackPlan::from_project(&project, 48_000.0)
+            .expect("synth project should build a playback plan");
 
         assert_eq!(plan.channels[0].voices.len(), 1);
         assert!((plan.channels[0].voices[0].frequency - 440.0).abs() < f32::EPSILON);
@@ -896,5 +1206,78 @@ mod tests {
         let second = tremolo_then_distortion.process([0.8, 0.8], 1_000.0);
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sampler_trimming_and_reverse_choose_the_expected_frames() {
+        let sample = SampleBuffer {
+            frames: vec![[0.0, 0.0], [0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
+            sample_rate: 4.0,
+        };
+        let mut sampler = crate::model::SampleSynth {
+            trim_start: 0.25,
+            trim_end: 0.75,
+            ..crate::model::SampleSynth::default()
+        };
+
+        assert_eq!(
+            sampler_frame(&sample, &sampler, 0, 1.0, 4.0),
+            Some([0.25, 0.25])
+        );
+        sampler.reverse = true;
+        assert_eq!(
+            sampler_frame(&sample, &sampler, 0, 1.0, 4.0),
+            Some([0.5, 0.5])
+        );
+    }
+
+    #[test]
+    fn sampler_channel_loads_wav_and_schedules_pattern_notes() {
+        let path =
+            std::env::temp_dir().join(format!("donttrackme-sampler-{}.wav", std::process::id()));
+        let specification = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, specification)
+            .expect("test sample should be creatable");
+        for sample in [0_i16, 1_000, -1_000, 0] {
+            writer
+                .write_sample(sample)
+                .expect("test sample should be writable");
+        }
+        writer
+            .finalize()
+            .expect("test sample should be finalizable");
+
+        let mut project = Project::default();
+        let channel_id = project.add_sampler();
+        let channel = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == channel_id)
+            .expect("sampler channel should exist");
+        let pattern_id = channel.source_id;
+        let TrackKind::Sampler { sampler } = &mut channel.kind else {
+            panic!("new sampler channel should contain a sampler");
+        };
+        sampler.path = Some(path.clone());
+        project
+            .add_note(pattern_id, 60, 0, 4, 127)
+            .expect("sampler pattern should exist");
+        project.ensure_primary_pattern_clip(channel_id);
+
+        let plan = PlaybackPlan::from_project(&project, 8_000.0)
+            .expect("sampler project should build a playback plan");
+        std::fs::remove_file(path).expect("test sample should be removable");
+
+        assert_eq!(plan.channels.len(), 1);
+        assert_eq!(plan.channels[0].voices.len(), 1);
+        assert!(matches!(
+            plan.channels[0].instrument,
+            RenderInstrument::Sampler { .. }
+        ));
     }
 }

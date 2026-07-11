@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Project;
 
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {

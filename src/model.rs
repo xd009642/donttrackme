@@ -155,6 +155,43 @@ pub struct SynthPreset {
     pub synth: SimpleWaveformSynth,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleSynth {
+    pub path: Option<PathBuf>,
+    pub root_pitch: u8,
+    pub trim_start: f32,
+    pub trim_end: f32,
+    pub speed: f32,
+    pub reverse: bool,
+    pub gain: f32,
+    pub pan: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub filter: FilterKind,
+    pub filter_cutoff_hz: f32,
+    pub filter_resonance: f32,
+}
+
+impl Default for SampleSynth {
+    fn default() -> Self {
+        Self {
+            path: None,
+            root_pitch: 60,
+            trim_start: 0.0,
+            trim_end: 1.0,
+            speed: 1.0,
+            reverse: false,
+            gain: 0.8,
+            pan: 0.0,
+            attack_ms: 0.0,
+            release_ms: 80.0,
+            filter: FilterKind::Off,
+            filter_cutoff_hz: 8_000.0,
+            filter_resonance: 0.1,
+        }
+    }
+}
+
 impl Default for SimpleWaveformSynth {
     fn default() -> Self {
         Self {
@@ -502,6 +539,7 @@ pub fn noise_sample(mut seed: u32) -> f32 {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackKind {
     Instrument { synth: SimpleWaveformSynth },
+    Sampler { sampler: SampleSynth },
     Sample,
 }
 
@@ -615,6 +653,21 @@ impl Track {
         track
     }
 
+    pub fn sampler(id: u64, source_id: u64, name: String) -> Self {
+        Self {
+            id,
+            name,
+            kind: TrackKind::Sampler {
+                sampler: SampleSynth::default(),
+            },
+            source_id,
+            clips: Vec::new(),
+            muted: false,
+            solo: false,
+            next_clip_id: 1,
+        }
+    }
+
     pub fn add_clip(&mut self, source_id: u64, start_step: u16, length_steps: u16) -> u64 {
         let id = self.next_clip_id;
         self.next_clip_id += 1;
@@ -695,6 +748,31 @@ impl Project {
             kind: ClipSourceKind::Sample { path: path.clone() },
         });
         self.tracks.push(Track::sample(id, source_id, path));
+        id
+    }
+
+    pub fn add_sampler(&mut self) -> u64 {
+        let id = self.next_track_id;
+        self.next_track_id += 1;
+        let source_id = self.next_source_id;
+        self.next_source_id += 1;
+        let number = self
+            .tracks
+            .iter()
+            .filter(|track| matches!(track.kind, TrackKind::Sampler { .. }))
+            .count()
+            + 1;
+        self.clip_library.push(ClipSource {
+            id: source_id,
+            channel_id: id,
+            name: format!("Sampler pattern {number}"),
+            length_steps: PATTERN_STEPS,
+            kind: ClipSourceKind::Pattern {
+                pattern: Pattern::default(),
+            },
+        });
+        self.tracks
+            .push(Track::sampler(id, source_id, format!("Sampler {number}")));
         id
     }
 
