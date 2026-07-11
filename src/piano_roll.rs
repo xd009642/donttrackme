@@ -8,8 +8,8 @@ const KEY_HEIGHT: f32 = 22.0;
 const KEYBOARD_WIDTH: f32 = 78.0;
 const STEP_WIDTH: f32 = 36.0;
 const VELOCITY_HEIGHT: f32 = 100.0;
-const LOWEST_PITCH: u8 = 48;
-const PITCH_COUNT: u8 = 25;
+const LOWEST_PITCH: u8 = 12;
+const PITCH_COUNT: u8 = 121;
 const STEPS: u16 = 32;
 const RESIZE_HANDLE_WIDTH: f32 = 7.0;
 
@@ -39,6 +39,7 @@ pub struct PianoRoll {
     clipboard: Vec<Note>,
     drag: Option<Drag>,
     track_id: Option<u64>,
+    scroll_to_middle_c: bool,
 }
 
 impl PianoRoll {
@@ -47,6 +48,7 @@ impl PianoRoll {
             self.selected.clear();
             self.drag = None;
             self.track_id = Some(track_id);
+            self.scroll_to_middle_c = true;
         }
 
         self.keyboard_shortcuts(ui, track);
@@ -57,6 +59,7 @@ impl PianoRoll {
             ui.separator();
             ui.weak("Ctrl/Cmd+C, X, V · Delete");
         });
+        ui.weak("Play: Z = C2 · S = C#2 · Q = C4 · number row supplies upper black notes");
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             let grid_height = KEY_HEIGHT * f32::from(PITCH_COUNT);
@@ -70,6 +73,15 @@ impl PianoRoll {
                 Pos2::new(rect.left() + KEYBOARD_WIDTH, rect.top()),
                 Vec2::new(STEP_WIDTH * f32::from(STEPS), grid_height),
             );
+            if self.scroll_to_middle_c {
+                let c4_row = PITCH_COUNT - 1 - (60 - LOWEST_PITCH);
+                let target = Rect::from_min_size(
+                    Pos2::new(grid.left(), grid.top() + f32::from(c4_row) * KEY_HEIGHT),
+                    Vec2::new(grid.width(), KEY_HEIGHT),
+                );
+                ui.scroll_to_rect(target, Some(egui::Align::Center));
+                self.scroll_to_middle_c = false;
+            }
             let velocity = Rect::from_min_max(
                 Pos2::new(grid.left(), grid.bottom() + 28.0),
                 Pos2::new(grid.right(), grid.bottom() + 28.0 + VELOCITY_HEIGHT),
@@ -475,4 +487,16 @@ fn note_name(pitch: u8) -> String {
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     format!("{}{}", NAMES[usize::from(pitch % 12)], pitch / 12 - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_name;
+
+    #[test]
+    fn extended_keyboard_uses_requested_octave_bounds() {
+        assert_eq!(note_name(12), "C0");
+        assert_eq!(note_name(60), "C4");
+        assert_eq!(note_name(132), "C10");
+    }
 }

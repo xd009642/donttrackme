@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
@@ -12,6 +14,46 @@ enum View {
     PianoRoll,
     Instrument,
 }
+
+const PIANO_KEYS: [(egui::Key, u8); 37] = [
+    (egui::Key::Z, 36),
+    (egui::Key::S, 37),
+    (egui::Key::X, 38),
+    (egui::Key::D, 39),
+    (egui::Key::C, 40),
+    (egui::Key::V, 41),
+    (egui::Key::G, 42),
+    (egui::Key::B, 43),
+    (egui::Key::H, 44),
+    (egui::Key::N, 45),
+    (egui::Key::J, 46),
+    (egui::Key::M, 47),
+    (egui::Key::Comma, 48),
+    (egui::Key::L, 49),
+    (egui::Key::Period, 50),
+    (egui::Key::Semicolon, 51),
+    (egui::Key::Slash, 52),
+    (egui::Key::Q, 60),
+    (egui::Key::Num2, 61),
+    (egui::Key::W, 62),
+    (egui::Key::Num3, 63),
+    (egui::Key::E, 64),
+    (egui::Key::R, 65),
+    (egui::Key::Num5, 66),
+    (egui::Key::T, 67),
+    (egui::Key::Num6, 68),
+    (egui::Key::Y, 69),
+    (egui::Key::Num7, 70),
+    (egui::Key::U, 71),
+    (egui::Key::I, 72),
+    (egui::Key::Num9, 73),
+    (egui::Key::O, 74),
+    (egui::Key::Num0, 75),
+    (egui::Key::P, 76),
+    (egui::Key::OpenBracket, 77),
+    (egui::Key::Equals, 78),
+    (egui::Key::CloseBracket, 79),
+];
 
 #[derive(Debug)]
 enum ClipDrag {
@@ -40,6 +82,7 @@ pub struct DawApp {
     clip_clipboard: Option<Clip>,
     audio: Option<AudioEngine>,
     audio_error: Option<String>,
+    auditioned_notes: HashSet<u8>,
 }
 
 impl DawApp {
@@ -60,6 +103,7 @@ impl DawApp {
             clip_clipboard: None,
             audio,
             audio_error,
+            auditioned_notes: HashSet::new(),
         }
     }
 
@@ -84,6 +128,50 @@ impl DawApp {
             self.selected_track = Some(self.project.add_sample(path));
             self.view = View::Arrangement;
         }
+    }
+
+    fn update_keyboard_audition(&mut self, context: &egui::Context) {
+        let desired = context.input(|input| {
+            if self.view != View::PianoRoll
+                || input.modifiers.command
+                || input.modifiers.ctrl
+                || input.modifiers.alt
+            {
+                HashSet::new()
+            } else {
+                PIANO_KEYS
+                    .iter()
+                    .filter(|(key, _)| input.key_down(*key))
+                    .map(|(_, pitch)| *pitch)
+                    .collect()
+            }
+        });
+        let synth = self.selected_track.and_then(|selected| {
+            self.project
+                .tracks
+                .iter()
+                .find(|track| track.id == selected)
+                .and_then(|track| match track.kind {
+                    TrackKind::Instrument { synth } => Some(synth),
+                    TrackKind::Sample => None,
+                })
+        });
+
+        if let Some(audio) = &self.audio {
+            if let Some(synth) = synth {
+                for pitch in desired.difference(&self.auditioned_notes) {
+                    if let Err(error) = audio.audition_start(*pitch, synth) {
+                        self.audio_error = Some(error);
+                    }
+                }
+            }
+            for pitch in self.auditioned_notes.difference(&desired) {
+                if let Err(error) = audio.audition_stop(*pitch) {
+                    self.audio_error = Some(error);
+                }
+            }
+        }
+        self.auditioned_notes = desired;
     }
 
     fn top_bar(&mut self, root: &mut egui::Ui) {
@@ -728,6 +816,7 @@ impl eframe::App for DawApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root.ctx().clone();
         self.add_dropped_samples(&context);
+        self.update_keyboard_audition(&context);
         self.top_bar(root);
         self.track_list(root);
         egui::CentralPanel::default().show(root, |ui| match self.view {

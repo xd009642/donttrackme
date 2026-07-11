@@ -12,6 +12,13 @@ const ARRANGEMENT_STEPS: u16 = 128;
 enum Command {
     Play(PlaybackPlan),
     Stop,
+    AuditionStart {
+        pitch: u8,
+        synth: SimpleWaveformSynth,
+    },
+    AuditionStop {
+        pitch: u8,
+    },
 }
 
 struct PlaybackPlan {
@@ -86,6 +93,18 @@ impl AudioEngine {
     pub fn stop(&self) -> Result<(), String> {
         self.commands
             .send(Command::Stop)
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn audition_start(&self, pitch: u8, synth: SimpleWaveformSynth) -> Result<(), String> {
+        self.commands
+            .send(Command::AuditionStart { pitch, synth })
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn audition_stop(&self, pitch: u8) -> Result<(), String> {
+        self.commands
+            .send(Command::AuditionStop { pitch })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 }
@@ -163,6 +182,15 @@ struct Renderer {
     plan: Option<PlaybackPlan>,
     position: u64,
     sample_rate: f32,
+    audition_voices: Vec<AuditionVoice>,
+}
+
+struct AuditionVoice {
+    pitch: u8,
+    synth: SimpleWaveformSynth,
+    frequency: f32,
+    elapsed: u64,
+    released_at: Option<u64>,
 }
 
 impl Renderer {
@@ -172,6 +200,7 @@ impl Renderer {
             plan: None,
             position: 0,
             sample_rate,
+            audition_voices: Vec::with_capacity(40),
         }
     }
 
@@ -189,6 +218,25 @@ impl Renderer {
                     self.plan = None;
                     self.position = 0;
                 }
+                Command::AuditionStart { pitch, synth } => {
+                    self.audition_voices.retain(|voice| voice.pitch != pitch);
+                    self.audition_voices.push(AuditionVoice {
+                        pitch,
+                        synth,
+                        frequency: 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0),
+                        elapsed: 0,
+                        released_at: None,
+                    });
+                }
+                Command::AuditionStop { pitch } => {
+                    if let Some(voice) = self
+                        .audition_voices
+                        .iter_mut()
+                        .find(|voice| voice.pitch == pitch && voice.released_at.is_none())
+                    {
+                        voice.released_at = Some(voice.elapsed);
+                    }
+                }
             }
         }
 
@@ -201,40 +249,69 @@ impl Renderer {
     }
 
     fn next_sample(&mut self) -> f32 {
-        let Some(plan) = &self.plan else {
-            return 0.0;
-        };
         let mut mixed = 0.0;
-        for voice in &plan.voices {
-            if self.position < voice.start_sample
-                || self.position >= voice.note_off_sample + voice.release_samples
-            {
-                continue;
+        if let Some(plan) = &self.plan {
+            for voice in &plan.voices {
+                if self.position < voice.start_sample
+                    || self.position >= voice.note_off_sample + voice.release_samples
+                {
+                    continue;
+                }
+                let elapsed = self.position - voice.start_sample;
+                let envelope = if elapsed < voice.attack_samples && voice.attack_samples > 0 {
+                    elapsed as f32 / voice.attack_samples as f32
+                } else if self.position < voice.note_off_sample {
+                    1.0
+                } else if voice.release_samples > 0 {
+                    1.0 - (self.position - voice.note_off_sample) as f32
+                        / voice.release_samples as f32
+                } else {
+                    0.0
+                };
+                let phase = elapsed as f32 * voice.frequency / self.sample_rate;
+                let hash = (elapsed as u32)
+                    .wrapping_mul(747_796_405)
+                    .wrapping_add(voice.start_sample as u32);
+                let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
+                mixed += voice.synth.waveform.sample(phase, noise)
+                    * envelope
+                    * voice.gain
+                    * voice.synth.level;
             }
-            let elapsed = self.position - voice.start_sample;
-            let envelope = if elapsed < voice.attack_samples && voice.attack_samples > 0 {
-                elapsed as f32 / voice.attack_samples as f32
-            } else if self.position < voice.note_off_sample {
-                1.0
-            } else if voice.release_samples > 0 {
-                1.0 - (self.position - voice.note_off_sample) as f32 / voice.release_samples as f32
-            } else {
-                0.0
-            };
-            let phase = elapsed as f32 * voice.frequency / self.sample_rate;
-            let hash = (elapsed as u32)
+            self.position += 1;
+            if self.position >= plan.loop_samples {
+                self.position = 0;
+            }
+        }
+
+        for voice in &mut self.audition_voices {
+            let attack = (voice.synth.attack_ms * self.sample_rate / 1_000.0).round() as u64;
+            let release = (voice.synth.release_ms * self.sample_rate / 1_000.0).round() as u64;
+            let envelope = match voice.released_at {
+                Some(released_at) if release > 0 => {
+                    1.0 - (voice.elapsed - released_at) as f32 / release as f32
+                }
+                Some(_) => 0.0,
+                None if voice.elapsed < attack && attack > 0 => {
+                    voice.elapsed as f32 / attack as f32
+                }
+                None => 1.0,
+            }
+            .clamp(0.0, 1.0);
+            let phase = voice.elapsed as f32 * voice.frequency / self.sample_rate;
+            let hash = (voice.elapsed as u32)
                 .wrapping_mul(747_796_405)
-                .wrapping_add(voice.start_sample as u32);
+                .wrapping_add(u32::from(voice.pitch));
             let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
-            mixed += voice.synth.waveform.sample(phase, noise)
-                * envelope
-                * voice.gain
-                * voice.synth.level;
+            mixed += voice.synth.waveform.sample(phase, noise) * envelope * voice.synth.level;
+            voice.elapsed += 1;
         }
-        self.position += 1;
-        if self.position >= plan.loop_samples {
-            self.position = 0;
-        }
+        self.audition_voices.retain(|voice| {
+            voice.released_at.is_none_or(|released_at| {
+                let release = (voice.synth.release_ms * self.sample_rate / 1_000.0).round() as u64;
+                voice.elapsed < released_at + release
+            })
+        });
         mixed.tanh()
     }
 }
