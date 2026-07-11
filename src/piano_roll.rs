@@ -128,6 +128,20 @@ impl PianoRoll {
         velocity: Rect,
         track: &mut Track,
     ) {
+        if response.clicked_by(egui::PointerButton::Secondary) {
+            if let Some(pointer) = response.interact_pointer_pos()
+                && let Some(note_id) = track
+                    .notes
+                    .iter()
+                    .rev()
+                    .find(|note| note_rect(grid, note).contains(pointer))
+                    .map(|note| note.id)
+            {
+                track.notes.retain(|note| note.id != note_id);
+                self.selected.remove(&note_id);
+            }
+            return;
+        }
         if !response.clicked() {
             return;
         }
