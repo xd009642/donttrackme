@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     audio::AudioEngine,
-    model::{Clip, ClipSourceKind, Project, TrackKind, Waveform},
+    model::{Clip, ClipSourceKind, FilterKind, Project, SimpleWaveformSynth, TrackKind, Waveform},
     piano_roll,
 };
 
@@ -664,10 +664,14 @@ impl DawApp {
             ui.label("Instrument");
             if let TrackKind::Instrument { synth } = &mut track.kind {
                 egui::ComboBox::from_id_salt("waveform")
-                    .selected_text(synth.waveform.name())
+                    .selected_text(synth.layers[0].waveform.name())
                     .show_ui(ui, |ui| {
                         for choice in Waveform::ALL {
-                            ui.selectable_value(&mut synth.waveform, choice, choice.name());
+                            ui.selectable_value(
+                                &mut synth.layers[0].waveform,
+                                choice,
+                                choice.name(),
+                            );
                         }
                     });
                 if ui.button("⚙ Settings").clicked() {
@@ -714,55 +718,168 @@ impl DawApp {
         });
         ui.add_space(12.0);
 
-        egui::Frame::group(ui.style())
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.set_max_width(720.0);
-                ui.heading("Oscillator");
-                ui.horizontal(|ui| {
-                    for waveform in Waveform::ALL {
-                        ui.selectable_value(&mut synth.waveform, waveform, waveform.name());
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(920.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Presets");
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in SimpleWaveformSynth::PRESETS {
+                            if ui
+                                .button(preset.name)
+                                .on_hover_text(preset.category)
+                                .clicked()
+                            {
+                                *synth = preset.synth;
+                            }
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Oscillator layers");
+                        ui.add(
+                            egui::Slider::new(&mut synth.layer_count, 1..=4)
+                                .text("Voices")
+                                .integer(),
+                        );
+                    });
+                    for (index, layer) in synth
+                        .layers
+                        .iter_mut()
+                        .take(usize::from(synth.layer_count))
+                        .enumerate()
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Voice {}", index + 1));
+                            egui::ComboBox::from_id_salt(("layer-waveform", index))
+                                .selected_text(layer.waveform.name())
+                                .show_ui(ui, |ui| {
+                                    for waveform in Waveform::ALL {
+                                        ui.selectable_value(
+                                            &mut layer.waveform,
+                                            waveform,
+                                            waveform.name(),
+                                        );
+                                    }
+                                });
+                            ui.add(
+                                egui::Slider::new(&mut layer.detune_cents, -100.0..=100.0)
+                                    .text("Detune")
+                                    .suffix(" cents"),
+                            );
+                            ui.add(egui::Slider::new(&mut layer.level, 0.0..=1.0).text("Volume"));
+                        });
                     }
+                    ui.add_space(8.0);
+                    waveform_preview(ui, synth);
                 });
-                ui.add_space(10.0);
-                waveform_preview(
-                    ui,
-                    synth.waveform,
-                    synth.level,
-                    synth.attack_ms,
-                    synth.release_ms,
-                );
-                ui.add_space(12.0);
-                ui.label("Output level");
-                ui.add(egui::Slider::new(&mut synth.level, 0.0..=1.0).show_value(true));
-
-                ui.add_space(14.0);
-                ui.heading("Envelope");
-                ui.columns(2, |columns| {
-                    columns[0].label("Attack");
-                    columns[0].add(
-                        egui::Slider::new(&mut synth.attack_ms, 0.0..=2_000.0)
-                            .logarithmic(true)
-                            .suffix(" ms"),
-                    );
-                    columns[1].label("Release");
-                    columns[1].add(
-                        egui::Slider::new(&mut synth.release_ms, 5.0..=5_000.0)
-                            .logarithmic(true)
-                            .suffix(" ms"),
-                    );
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Amplifier and pitch");
+                    ui.columns(3, |columns| {
+                        columns[0].add(
+                            egui::Slider::new(&mut synth.master_level, 0.0..=1.0)
+                                .text("Master volume"),
+                        );
+                        columns[1].add(
+                            egui::Slider::new(&mut synth.pan, -1.0..=1.0)
+                                .text("Pan")
+                                .custom_formatter(|value, _| {
+                                    if value.abs() < 0.01 {
+                                        "Centre".to_owned()
+                                    } else if value < 0.0 {
+                                        format!("L {:.0}%", -value * 100.0)
+                                    } else {
+                                        format!("R {:.0}%", value * 100.0)
+                                    }
+                                }),
+                        );
+                        columns[2].add(
+                            egui::Slider::new(&mut synth.pitch_shift, -24..=24)
+                                .text("Pitch")
+                                .suffix(" semitones"),
+                        );
+                    });
                 });
-            });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("ADSR envelope");
+                    ui.columns(4, |columns| {
+                        columns[0].add(
+                            egui::Slider::new(&mut synth.attack_ms, 0.0..=2_000.0)
+                                .text("Attack")
+                                .suffix(" ms"),
+                        );
+                        columns[1].add(
+                            egui::Slider::new(&mut synth.decay_ms, 0.0..=3_000.0)
+                                .text("Decay")
+                                .suffix(" ms"),
+                        );
+                        columns[2]
+                            .add(egui::Slider::new(&mut synth.sustain, 0.0..=1.0).text("Sustain"));
+                        columns[3].add(
+                            egui::Slider::new(&mut synth.release_ms, 0.0..=5_000.0)
+                                .text("Release")
+                                .suffix(" ms"),
+                        );
+                    });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Playing mode");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut synth.mono, "Mono");
+                        ui.add_enabled(
+                            synth.mono,
+                            egui::Slider::new(&mut synth.glide_ms, 0.0..=1_000.0)
+                                .text("Pitch glide")
+                                .suffix(" ms"),
+                        );
+                    });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Filter");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("filter-kind")
+                            .selected_text(synth.filter.name())
+                            .show_ui(ui, |ui| {
+                                for filter in FilterKind::ALL {
+                                    ui.selectable_value(&mut synth.filter, filter, filter.name());
+                                }
+                            });
+                        ui.add_enabled(
+                            synth.filter != FilterKind::Off,
+                            egui::Slider::new(&mut synth.filter_cutoff_hz, 20.0..=20_000.0)
+                                .logarithmic(true)
+                                .text("Cutoff")
+                                .suffix(" Hz"),
+                        );
+                        ui.add_enabled(
+                            synth.filter != FilterKind::Off,
+                            egui::Slider::new(&mut synth.filter_resonance, 0.0..=0.95)
+                                .text("Resonance"),
+                        );
+                    });
+                });
+        });
     }
 }
 
-fn waveform_preview(
-    ui: &mut egui::Ui,
-    waveform: Waveform,
-    level: f32,
-    attack_ms: f32,
-    release_ms: f32,
-) {
+fn waveform_preview(ui: &mut egui::Ui, synth: &SimpleWaveformSynth) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(680.0, 170.0), egui::Sense::hover());
     ui.painter()
         .rect_filled(rect, 5.0, Color32::from_rgb(22, 26, 32));
@@ -771,35 +888,47 @@ fn waveform_preview(
         egui::Stroke::new(1.0, Color32::from_gray(55)),
     );
     let held_ms = 500.0;
-    let preview_ms = attack_ms + held_ms + release_ms;
-    let note_off_ms = attack_ms + held_ms;
+    let preview_ms = synth.attack_ms + synth.decay_ms + held_ms + synth.release_ms;
+    let note_off_ms = synth.attack_ms + synth.decay_ms + held_ms;
     let mut envelope_points = Vec::with_capacity(257);
     let points = (0..=256)
         .map(|index| {
             let progress = index as f32 / 256.0;
             let time_ms = progress * preview_ms;
-            let envelope = if time_ms < attack_ms && attack_ms > 0.0 {
-                time_ms / attack_ms
+            let envelope = if time_ms < synth.attack_ms && synth.attack_ms > 0.0 {
+                time_ms / synth.attack_ms
+            } else if time_ms < synth.attack_ms + synth.decay_ms && synth.decay_ms > 0.0 {
+                let decay = (time_ms - synth.attack_ms) / synth.decay_ms;
+                1.0 + (synth.sustain - 1.0) * decay
             } else if time_ms <= note_off_ms {
-                1.0
-            } else if release_ms > 0.0 {
-                1.0 - (time_ms - note_off_ms) / release_ms
+                synth.sustain
+            } else if synth.release_ms > 0.0 {
+                synth.sustain * (1.0 - (time_ms - note_off_ms) / synth.release_ms)
             } else {
                 0.0
             };
-            let phase = progress * 12.0;
+            let phase = progress * 12.0 * 2.0_f32.powf(f32::from(synth.pitch_shift) / 12.0);
             let value = (index as u32)
                 .wrapping_mul(747_796_405)
                 .wrapping_add(2_891_336_453);
             let noise = (value as f32 / u32::MAX as f32) * 2.0 - 1.0;
-            let sample = waveform.sample(phase, noise) * envelope;
+            let sample = synth
+                .layers
+                .iter()
+                .take(usize::from(synth.layer_count))
+                .map(|layer| {
+                    let detuned_phase = phase * 2.0_f32.powf(layer.detune_cents / 1_200.0);
+                    layer.waveform.sample(detuned_phase, noise) * layer.level
+                })
+                .sum::<f32>()
+                / f32::from(synth.layer_count);
             envelope_points.push(egui::pos2(
                 rect.left() + rect.width() * progress,
-                rect.center().y - envelope * level * rect.height() * 0.42,
+                rect.center().y - envelope * synth.master_level * rect.height() * 0.42,
             ));
             egui::pos2(
                 rect.left() + rect.width() * progress,
-                rect.center().y - sample * level * rect.height() * 0.42,
+                rect.center().y - sample * envelope * synth.master_level * rect.height() * 0.42,
             )
         })
         .collect::<Vec<_>>();

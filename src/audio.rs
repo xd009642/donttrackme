@@ -5,7 +5,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::model::{Project, SimpleWaveformSynth, TrackKind};
+use crate::model::{FilterKind, Project, SimpleWaveformSynth, TrackKind};
 
 const ARRANGEMENT_STEPS: u16 = 128;
 
@@ -29,11 +29,17 @@ struct PlaybackPlan {
 struct Voice {
     start_sample: u64,
     note_off_sample: u64,
-    release_samples: u64,
-    attack_samples: u64,
     frequency: f32,
+    glide_from_frequency: f32,
     gain: f32,
     synth: SimpleWaveformSynth,
+    filter: FilterState,
+}
+
+#[derive(Default)]
+struct FilterState {
+    low: f32,
+    band: f32,
 }
 
 pub struct AudioEngine {
@@ -111,8 +117,7 @@ impl AudioEngine {
 
 impl PlaybackPlan {
     fn from_project(project: &Project, sample_rate: f32) -> Self {
-        let seconds_per_step = 60.0 / project.bpm / 4.0;
-        let samples_per_step = sample_rate * seconds_per_step;
+        let samples_per_step = sample_rate * 60.0 / project.bpm / 4.0;
         let any_solo = project.tracks.iter().any(|track| track.solo);
         let mut voices = Vec::new();
 
@@ -123,6 +128,7 @@ impl PlaybackPlan {
             let TrackKind::Instrument { synth } = track.kind else {
                 continue;
             };
+            let mut track_voices = Vec::new();
             for clip in &track.clips {
                 for note in &track.notes {
                     if note.start_step >= clip.length_steps {
@@ -132,21 +138,35 @@ impl PlaybackPlan {
                     if start_step >= ARRANGEMENT_STEPS {
                         continue;
                     }
-                    let note_end = note.start_step + note.length_steps;
-                    let end_step = clip.start_step + note_end.min(clip.length_steps);
-                    let start_sample = (f32::from(start_step) * samples_per_step).round() as u64;
-                    let note_off_sample = (f32::from(end_step) * samples_per_step).round() as u64;
-                    voices.push(Voice {
-                        start_sample,
-                        note_off_sample,
-                        release_samples: (synth.release_ms * sample_rate / 1_000.0).round() as u64,
-                        attack_samples: (synth.attack_ms * sample_rate / 1_000.0).round() as u64,
-                        frequency: 440.0 * 2.0_f32.powf((f32::from(note.pitch) - 69.0) / 12.0),
+                    let end_step = clip.start_step
+                        + (note.start_step + note.length_steps).min(clip.length_steps);
+                    let frequency = pitch_frequency(note.pitch, synth.pitch_shift);
+                    track_voices.push(Voice {
+                        start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
+                        note_off_sample: (f32::from(end_step) * samples_per_step).round() as u64,
+                        frequency,
+                        glide_from_frequency: frequency,
                         gain: f32::from(note.velocity) / 127.0,
                         synth,
+                        filter: FilterState::default(),
                     });
                 }
             }
+            track_voices.sort_by_key(|voice| voice.start_sample);
+            if synth.mono {
+                for index in 0..track_voices.len() {
+                    if index > 0 {
+                        track_voices[index].glide_from_frequency =
+                            track_voices[index - 1].frequency;
+                    }
+                    if index + 1 < track_voices.len() {
+                        track_voices[index].note_off_sample = track_voices[index]
+                            .note_off_sample
+                            .min(track_voices[index + 1].start_sample);
+                    }
+                }
+            }
+            voices.extend(track_voices);
         }
 
         Self {
@@ -165,8 +185,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels);
-    let sample_rate = config.sample_rate as f32;
-    let mut renderer = Renderer::new(receiver, sample_rate);
+    let mut renderer = Renderer::new(receiver, config.sample_rate as f32);
     device
         .build_output_stream(
             *config,
@@ -189,8 +208,11 @@ struct AuditionVoice {
     pitch: u8,
     synth: SimpleWaveformSynth,
     frequency: f32,
+    glide_from_frequency: f32,
+    glide_elapsed: u64,
     elapsed: u64,
-    released_at: Option<u64>,
+    released_at: Option<(u64, f32)>,
+    filter: FilterState,
 }
 
 impl Renderer {
@@ -208,6 +230,20 @@ impl Renderer {
     where
         T: Sample + FromSample<f32>,
     {
+        self.receive_commands();
+        for frame in output.chunks_mut(channels) {
+            let [left, right] = self.next_frame();
+            if channels == 1 {
+                frame[0] = T::from_sample((left + right) * 0.5);
+            } else {
+                for (index, sample) in frame.iter_mut().enumerate() {
+                    *sample = T::from_sample(if index % 2 == 0 { left } else { right });
+                }
+            }
+        }
+    }
+
+    fn receive_commands(&mut self) {
         while let Ok(command) = self.receiver.try_recv() {
             match command {
                 Command::Play(plan) => {
@@ -218,108 +254,231 @@ impl Renderer {
                     self.plan = None;
                     self.position = 0;
                 }
-                Command::AuditionStart { pitch, synth } => {
-                    self.audition_voices.retain(|voice| voice.pitch != pitch);
-                    self.audition_voices.push(AuditionVoice {
-                        pitch,
-                        synth,
-                        frequency: 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0),
-                        elapsed: 0,
-                        released_at: None,
-                    });
-                }
+                Command::AuditionStart { pitch, synth } => self.start_audition(pitch, synth),
                 Command::AuditionStop { pitch } => {
-                    if let Some(voice) = self
+                    for voice in self
                         .audition_voices
                         .iter_mut()
-                        .find(|voice| voice.pitch == pitch && voice.released_at.is_none())
+                        .filter(|voice| voice.pitch == pitch && voice.released_at.is_none())
                     {
-                        voice.released_at = Some(voice.elapsed);
+                        let level = held_envelope(&voice.synth, voice.elapsed, self.sample_rate);
+                        voice.released_at = Some((voice.elapsed, level));
                     }
                 }
             }
         }
-
-        for frame in output.chunks_mut(channels) {
-            let value = self.next_sample();
-            for sample in frame {
-                *sample = T::from_sample(value);
-            }
-        }
     }
 
-    fn next_sample(&mut self) -> f32 {
-        let mut mixed = 0.0;
-        if let Some(plan) = &self.plan {
-            for voice in &plan.voices {
-                if self.position < voice.start_sample
-                    || self.position >= voice.note_off_sample + voice.release_samples
-                {
+    fn start_audition(&mut self, pitch: u8, synth: SimpleWaveformSynth) {
+        let frequency = pitch_frequency(pitch, synth.pitch_shift);
+        if synth.mono
+            && let Some(voice) = self.audition_voices.first_mut()
+        {
+            let current_frequency = glide_frequency(
+                voice.glide_from_frequency,
+                voice.frequency,
+                voice.glide_elapsed,
+                ms_samples(voice.synth.glide_ms, self.sample_rate),
+            );
+            voice.pitch = pitch;
+            voice.synth = synth;
+            voice.glide_from_frequency = current_frequency;
+            voice.frequency = frequency;
+            voice.glide_elapsed = 0;
+            voice.released_at = None;
+            return;
+        }
+        self.audition_voices.retain(|voice| voice.pitch != pitch);
+        self.audition_voices.push(AuditionVoice {
+            pitch,
+            synth,
+            frequency,
+            glide_from_frequency: frequency,
+            glide_elapsed: 0,
+            elapsed: 0,
+            released_at: None,
+            filter: FilterState::default(),
+        });
+    }
+
+    fn next_frame(&mut self) -> [f32; 2] {
+        let mut output = [0.0, 0.0];
+        if let Some(plan) = &mut self.plan {
+            for voice in &mut plan.voices {
+                if self.position < voice.start_sample {
                     continue;
                 }
                 let elapsed = self.position - voice.start_sample;
-                let envelope = if elapsed < voice.attack_samples && voice.attack_samples > 0 {
-                    elapsed as f32 / voice.attack_samples as f32
-                } else if self.position < voice.note_off_sample {
-                    1.0
-                } else if voice.release_samples > 0 {
-                    1.0 - (self.position - voice.note_off_sample) as f32
-                        / voice.release_samples as f32
-                } else {
-                    0.0
-                };
-                let phase = elapsed as f32 * voice.frequency / self.sample_rate;
-                let hash = (elapsed as u32)
-                    .wrapping_mul(747_796_405)
-                    .wrapping_add(voice.start_sample as u32);
-                let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
-                mixed += voice.synth.waveform.sample(phase, noise)
+                let release_samples = ms_samples(voice.synth.release_ms, self.sample_rate);
+                if self.position >= voice.note_off_sample + release_samples {
+                    continue;
+                }
+                let note_length = voice.note_off_sample - voice.start_sample;
+                let envelope = note_envelope(&voice.synth, elapsed, note_length, self.sample_rate);
+                let glide_samples = ms_samples(voice.synth.glide_ms, self.sample_rate);
+                let frequency = glide_frequency(
+                    voice.glide_from_frequency,
+                    voice.frequency,
+                    elapsed,
+                    glide_samples,
+                );
+                let raw = oscillator_sample(&voice.synth, elapsed, frequency, self.sample_rate)
                     * envelope
                     * voice.gain
-                    * voice.synth.level;
+                    * voice.synth.master_level;
+                let filtered = voice.filter.process(raw, &voice.synth, self.sample_rate);
+                add_panned(&mut output, filtered, voice.synth.pan);
             }
             self.position += 1;
             if self.position >= plan.loop_samples {
                 self.position = 0;
+                for voice in &mut plan.voices {
+                    voice.filter = FilterState::default();
+                }
             }
         }
 
         for voice in &mut self.audition_voices {
-            let attack = (voice.synth.attack_ms * self.sample_rate / 1_000.0).round() as u64;
-            let release = (voice.synth.release_ms * self.sample_rate / 1_000.0).round() as u64;
             let envelope = match voice.released_at {
-                Some(released_at) if release > 0 => {
-                    1.0 - (voice.elapsed - released_at) as f32 / release as f32
+                Some((released_at, release_level)) => {
+                    let release = ms_samples(voice.synth.release_ms, self.sample_rate);
+                    if release == 0 {
+                        0.0
+                    } else {
+                        release_level
+                            * (1.0 - (voice.elapsed - released_at) as f32 / release as f32)
+                                .clamp(0.0, 1.0)
+                    }
                 }
-                Some(_) => 0.0,
-                None if voice.elapsed < attack && attack > 0 => {
-                    voice.elapsed as f32 / attack as f32
-                }
-                None => 1.0,
-            }
-            .clamp(0.0, 1.0);
-            let phase = voice.elapsed as f32 * voice.frequency / self.sample_rate;
-            let hash = (voice.elapsed as u32)
-                .wrapping_mul(747_796_405)
-                .wrapping_add(u32::from(voice.pitch));
-            let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
-            mixed += voice.synth.waveform.sample(phase, noise) * envelope * voice.synth.level;
+                None => held_envelope(&voice.synth, voice.elapsed, self.sample_rate),
+            };
+            let frequency = glide_frequency(
+                voice.glide_from_frequency,
+                voice.frequency,
+                voice.glide_elapsed,
+                ms_samples(voice.synth.glide_ms, self.sample_rate),
+            );
+            let raw = oscillator_sample(&voice.synth, voice.elapsed, frequency, self.sample_rate)
+                * envelope
+                * voice.synth.master_level;
+            let filtered = voice.filter.process(raw, &voice.synth, self.sample_rate);
+            add_panned(&mut output, filtered, voice.synth.pan);
             voice.elapsed += 1;
+            voice.glide_elapsed += 1;
         }
         self.audition_voices.retain(|voice| {
-            voice.released_at.is_none_or(|released_at| {
-                let release = (voice.synth.release_ms * self.sample_rate / 1_000.0).round() as u64;
-                voice.elapsed < released_at + release
+            voice.released_at.is_none_or(|(released_at, _)| {
+                voice.elapsed < released_at + ms_samples(voice.synth.release_ms, self.sample_rate)
             })
         });
-        mixed.tanh()
+
+        [output[0].tanh(), output[1].tanh()]
     }
+}
+
+impl FilterState {
+    fn process(&mut self, input: f32, synth: &SimpleWaveformSynth, sample_rate: f32) -> f32 {
+        if synth.filter == FilterKind::Off {
+            return input;
+        }
+        let cutoff = synth.filter_cutoff_hz.clamp(20.0, sample_rate * 0.45);
+        let frequency = ((std::f32::consts::PI * cutoff / sample_rate).sin() * 2.0).min(0.99);
+        let damping = (2.0 * (1.0 - synth.filter_resonance.powf(0.25))).clamp(0.05, 2.0);
+        self.low += frequency * self.band;
+        let high = input - self.low - damping * self.band;
+        self.band += frequency * high;
+        match synth.filter {
+            FilterKind::Off => input,
+            FilterKind::LowPass => self.low,
+            FilterKind::HighPass => high,
+            FilterKind::BandPass => self.band,
+        }
+    }
+}
+
+fn held_envelope(synth: &SimpleWaveformSynth, elapsed: u64, sample_rate: f32) -> f32 {
+    let attack = ms_samples(synth.attack_ms, sample_rate);
+    let decay = ms_samples(synth.decay_ms, sample_rate);
+    if elapsed < attack && attack > 0 {
+        elapsed as f32 / attack as f32
+    } else if elapsed < attack + decay && decay > 0 {
+        let progress = (elapsed - attack) as f32 / decay as f32;
+        1.0 + (synth.sustain - 1.0) * progress
+    } else {
+        synth.sustain
+    }
+}
+
+fn note_envelope(
+    synth: &SimpleWaveformSynth,
+    elapsed: u64,
+    note_length: u64,
+    sample_rate: f32,
+) -> f32 {
+    if elapsed < note_length {
+        held_envelope(synth, elapsed, sample_rate)
+    } else {
+        let release = ms_samples(synth.release_ms, sample_rate);
+        if release == 0 {
+            0.0
+        } else {
+            held_envelope(synth, note_length, sample_rate)
+                * (1.0 - (elapsed - note_length) as f32 / release as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn oscillator_sample(
+    synth: &SimpleWaveformSynth,
+    elapsed: u64,
+    frequency: f32,
+    sample_rate: f32,
+) -> f32 {
+    let hash = (elapsed as u32)
+        .wrapping_mul(747_796_405)
+        .wrapping_add(frequency.to_bits());
+    let noise = hash as f32 / u32::MAX as f32 * 2.0 - 1.0;
+    synth
+        .layers
+        .iter()
+        .take(usize::from(synth.layer_count))
+        .map(|layer| {
+            let detuned_frequency = frequency * 2.0_f32.powf(layer.detune_cents / 1_200.0);
+            let phase = elapsed as f32 * detuned_frequency / sample_rate;
+            layer.waveform.sample(phase, noise) * layer.level
+        })
+        .sum::<f32>()
+        / f32::from(synth.layer_count)
+}
+
+fn pitch_frequency(pitch: u8, shift: i8) -> f32 {
+    440.0 * 2.0_f32.powf((f32::from(pitch) + f32::from(shift) - 69.0) / 12.0)
+}
+
+fn glide_frequency(from: f32, to: f32, elapsed: u64, glide_samples: u64) -> f32 {
+    if glide_samples == 0 || elapsed >= glide_samples {
+        to
+    } else {
+        from * (to / from).powf(elapsed as f32 / glide_samples as f32)
+    }
+}
+
+fn ms_samples(milliseconds: f32, sample_rate: f32) -> u64 {
+    (milliseconds * sample_rate / 1_000.0).round() as u64
+}
+
+fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    output[0] += sample * angle.cos();
+    output[1] += sample * angle.sin();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PlaybackPlan;
-    use crate::model::Project;
+    use super::{
+        PlaybackPlan, add_panned, glide_frequency, held_envelope, note_envelope, pitch_frequency,
+    };
+    use crate::model::{Project, SimpleWaveformSynth, TrackKind};
 
     #[test]
     fn playback_plan_places_and_trims_notes_with_the_clip() {
@@ -347,8 +506,68 @@ mod tests {
         track.ensure_pattern_clip();
         track.muted = true;
 
+        assert!(
+            PlaybackPlan::from_project(&project, 48_000.0)
+                .voices
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn adsr_reaches_sustain_after_attack_and_decay() {
+        let synth = SimpleWaveformSynth {
+            attack_ms: 100.0,
+            decay_ms: 100.0,
+            sustain: 0.4,
+            release_ms: 100.0,
+            ..SimpleWaveformSynth::default()
+        };
+
+        assert_eq!(held_envelope(&synth, 0, 1_000.0), 0.0);
+        assert!((held_envelope(&synth, 100, 1_000.0) - 1.0).abs() < f32::EPSILON);
+        assert!((held_envelope(&synth, 200, 1_000.0) - 0.4).abs() < f32::EPSILON);
+        assert!((note_envelope(&synth, 250, 200, 1_000.0) - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pitch_shift_and_glide_are_exponential() {
+        assert!((pitch_frequency(69, 12) - 880.0).abs() < f32::EPSILON);
+        assert!((glide_frequency(220.0, 880.0, 50, 100) - 440.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn hard_pan_routes_to_only_one_channel() {
+        let mut left = [0.0, 0.0];
+        let mut right = [0.0, 0.0];
+
+        add_panned(&mut left, 1.0, -1.0);
+        add_panned(&mut right, 1.0, 1.0);
+
+        assert!((left[0] - 1.0).abs() < f32::EPSILON);
+        assert!(left[1].abs() < f32::EPSILON);
+        assert!(right[0].abs() < 0.000_001);
+        assert!((right[1] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mono_arrangement_voices_glide_from_the_previous_note() {
+        let mut project = Project::default();
+        let track = &mut project.tracks[0];
+        let TrackKind::Instrument { synth } = &mut track.kind else {
+            panic!("the default track is an instrument");
+        };
+        synth.mono = true;
+        track.add_note(60, 0, 8, 100);
+        track.add_note(72, 4, 4, 100);
+        track.ensure_pattern_clip();
+
         let plan = PlaybackPlan::from_project(&project, 48_000.0);
 
-        assert!(plan.voices.is_empty());
+        assert_eq!(plan.voices.len(), 2);
+        assert_eq!(plan.voices[0].note_off_sample, plan.voices[1].start_sample);
+        assert_eq!(
+            plan.voices[1].glide_from_frequency,
+            plan.voices[0].frequency
+        );
     }
 }
