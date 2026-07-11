@@ -2,15 +2,15 @@ use std::collections::HashSet;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::model::{Note, Track};
+use crate::model::{Note, PATTERN_STEPS, STEPS_PER_BEAT, Track};
 
 const KEY_HEIGHT: f32 = 22.0;
 const KEYBOARD_WIDTH: f32 = 78.0;
-const STEP_WIDTH: f32 = 36.0;
+const STEP_WIDTH: f32 = 18.0;
 const VELOCITY_HEIGHT: f32 = 100.0;
 const LOWEST_PITCH: u8 = 12;
 const PITCH_COUNT: u8 = 121;
-const STEPS: u16 = 32;
+const STEPS: u16 = PATTERN_STEPS;
 const RESIZE_HANDLE_WIDTH: f32 = 7.0;
 
 #[derive(Debug)]
@@ -37,6 +37,7 @@ enum Drag {
 pub struct PianoRoll {
     selected: HashSet<u64>,
     clipboard: Vec<Note>,
+    clipboard_offset: u16,
     drag: Option<Drag>,
     track_id: Option<u64>,
     scroll_to_middle_c: bool,
@@ -231,33 +232,33 @@ impl PianoRoll {
                 .filter(|note| self.selected.contains(&note.id))
                 .copied()
                 .collect();
+            self.clipboard_offset = STEPS_PER_BEAT;
         }
         if cut || delete {
             track.notes.retain(|note| !self.selected.contains(&note.id));
             self.selected.clear();
         }
         if paste && !self.clipboard.is_empty() {
-            let first_step = self
-                .clipboard
-                .iter()
-                .map(|note| note.start_step)
-                .min()
-                .expect("a non-empty clipboard has a first note");
-            self.selected.clear();
-            for note in &self.clipboard {
-                let start = note.start_step - first_step + 4;
-                if start < STEPS {
-                    let id = track.add_note(
-                        note.pitch,
-                        start,
-                        note.length_steps.min(STEPS - start),
-                        note.velocity,
-                    );
-                    self.selected.insert(id);
-                }
-            }
-            track.ensure_pattern_clip();
+            self.paste_clipboard(track);
         }
+    }
+
+    fn paste_clipboard(&mut self, track: &mut Track) {
+        self.selected.clear();
+        for note in &self.clipboard {
+            let start = note.start_step.saturating_add(self.clipboard_offset);
+            if start < STEPS {
+                let id = track.add_note(
+                    note.pitch,
+                    start,
+                    note.length_steps.min(STEPS - start),
+                    note.velocity,
+                );
+                self.selected.insert(id);
+            }
+        }
+        self.clipboard_offset = self.clipboard_offset.saturating_add(STEPS_PER_BEAT);
+        track.ensure_pattern_clip();
     }
 
     fn begin_drag(
@@ -454,7 +455,7 @@ impl PianoRoll {
         painter.rect_filled(grid, 0.0, Color32::from_rgb(28, 31, 38));
         for step in 0..=STEPS {
             let x = grid.left() + f32::from(step) * STEP_WIDTH;
-            let beat = step % 4 == 0;
+            let beat = step % STEPS_PER_BEAT == 0;
             painter.line_segment(
                 [Pos2::new(x, grid.top()), Pos2::new(x, grid.bottom())],
                 Stroke::new(
@@ -555,12 +556,35 @@ fn note_name(pitch: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::note_name;
+    use super::{PianoRoll, STEPS_PER_BEAT, note_name};
+    use crate::model::{Note, Track};
 
     #[test]
     fn extended_keyboard_uses_requested_octave_bounds() {
         assert_eq!(note_name(12), "C0");
         assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(132), "C10");
+    }
+
+    #[test]
+    fn repeated_pastes_advance_without_overlapping_the_source() {
+        let mut piano_roll = PianoRoll {
+            clipboard: vec![Note {
+                id: 99,
+                pitch: 60,
+                start_step: 3,
+                length_steps: 2,
+                velocity: 100,
+            }],
+            clipboard_offset: STEPS_PER_BEAT,
+            ..PianoRoll::default()
+        };
+        let mut track = Track::instrument(1, 1, "Synth".to_owned());
+
+        piano_roll.paste_clipboard(&mut track);
+        piano_roll.paste_clipboard(&mut track);
+
+        assert_eq!(track.notes[0].start_step, 3 + STEPS_PER_BEAT);
+        assert_eq!(track.notes[1].start_step, 3 + STEPS_PER_BEAT * 2);
     }
 }

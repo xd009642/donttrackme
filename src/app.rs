@@ -4,7 +4,10 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     audio::{self, AudioEngine},
-    model::{Clip, ClipSourceKind, FilterKind, Project, SimpleWaveformSynth, TrackKind, Waveform},
+    model::{
+        ARRANGEMENT_STEPS, Clip, ClipSourceKind, FilterKind, PATTERN_STEPS, Project, STEPS_PER_BAR,
+        STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform,
+    },
     piano_roll, project_io,
 };
 
@@ -415,7 +418,8 @@ impl DawApp {
                         .map(|clip| clip.start_step + clip.length_steps)
                         .max()
                         .unwrap_or(0);
-                    let id = track.add_clip(start.min(127), length.min(128 - start.min(127)));
+                    let start = start.min(ARRANGEMENT_STEPS - 1);
+                    let id = track.add_clip(start, length.min(ARRANGEMENT_STEPS - start));
                     debug_assert_eq!(
                         track.clips.last().map(|clip| clip.source_id),
                         Some(source_id)
@@ -427,8 +431,8 @@ impl DawApp {
     }
 
     fn arrangement(&mut self, ui: &mut egui::Ui) {
-        const STEPS: u16 = 128;
-        const STEP_WIDTH: f32 = 24.0;
+        const STEPS: u16 = ARRANGEMENT_STEPS;
+        const STEP_WIDTH: f32 = 12.0;
         const TRACK_HEIGHT: f32 = 58.0;
         const HANDLE_WIDTH: f32 = 7.0;
 
@@ -526,7 +530,7 @@ impl DawApp {
                     egui::Sense::hover(),
                 );
                 for bar in 0..8 {
-                    let x = header.left() + bar as f32 * STEP_WIDTH * 16.0;
+                    let x = header.left() + bar as f32 * STEP_WIDTH * f32::from(STEPS_PER_BAR);
                     ui.painter().text(
                         egui::pos2(x + 5.0, header.center().y),
                         egui::Align2::LEFT_CENTER,
@@ -552,7 +556,7 @@ impl DawApp {
                                 .max()
                                 .unwrap_or(0);
                             if start < STEPS {
-                                let id = track.add_clip(start, 32_u16.min(STEPS - start));
+                                let id = track.add_clip(start, PATTERN_STEPS.min(STEPS - start));
                                 self.selected_clip = Some((track.id, id));
                             }
                         }
@@ -568,14 +572,14 @@ impl DawApp {
                         ui.painter().line_segment(
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                             egui::Stroke::new(
-                                if step % 16 == 0 {
+                                if step % STEPS_PER_BAR == 0 {
                                     1.5
-                                } else if step % 4 == 0 {
+                                } else if step % STEPS_PER_BEAT == 0 {
                                     1.0
                                 } else {
                                     0.5
                                 },
-                                Color32::from_gray(if step % 16 == 0 { 70 } else { 48 }),
+                                Color32::from_gray(if step % STEPS_PER_BAR == 0 { 70 } else { 48 }),
                             ),
                         );
                     }

@@ -8,9 +8,9 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::model::{FilterKind, Project, SimpleWaveformSynth, TrackKind};
-
-const ARRANGEMENT_STEPS: u16 = 128;
+use crate::model::{
+    ARRANGEMENT_STEPS, FilterKind, Project, STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind,
+};
 
 enum Command {
     Play(PlaybackPlan),
@@ -149,7 +149,7 @@ pub fn export_wav(project: &Project, path: &Path) -> Result<(), String> {
 
 impl PlaybackPlan {
     fn from_project(project: &Project, sample_rate: f32) -> Self {
-        let samples_per_step = sample_rate * 60.0 / project.bpm / 4.0;
+        let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
         let any_solo = project.tracks.iter().any(|track| track.solo);
         let mut voices = Vec::new();
 
@@ -526,8 +526,8 @@ mod tests {
         let plan = PlaybackPlan::from_project(&project, 100.0);
 
         assert_eq!(plan.voices.len(), 1);
-        assert_eq!(plan.voices[0].start_sample, 150);
-        assert_eq!(plan.voices[0].note_off_sample, 175);
+        assert_eq!(plan.voices[0].start_sample, 75);
+        assert_eq!(plan.voices[0].note_off_sample, 88);
         assert!((plan.voices[0].frequency - 440.0).abs() < f32::EPSILON);
     }
 

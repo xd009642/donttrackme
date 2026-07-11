@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub const STEPS_PER_BEAT: u16 = 8;
+pub const STEPS_PER_BAR: u16 = STEPS_PER_BEAT * 4;
+pub const ARRANGEMENT_STEPS: u16 = STEPS_PER_BAR * 8;
+pub const PATTERN_STEPS: u16 = STEPS_PER_BAR * 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Waveform {
     Sine,
@@ -92,6 +97,25 @@ macro_rules! preset {
     ($name:expr, $category:expr, $waveform:expr, $layer_count:expr, $detune:expr,
      $layer_level:expr, $attack:expr, $decay:expr, $sustain:expr, $release:expr,
      $filter:expr, $cutoff:expr $(,)?) => {{
+        preset!(
+            $name,
+            $category,
+            $waveform,
+            $layer_count,
+            $detune,
+            $layer_level,
+            $attack,
+            $decay,
+            $sustain,
+            $release,
+            0,
+            $filter,
+            $cutoff
+        )
+    }};
+    ($name:expr, $category:expr, $waveform:expr, $layer_count:expr, $detune:expr,
+     $layer_level:expr, $attack:expr, $decay:expr, $sustain:expr, $release:expr,
+     $pitch:expr, $filter:expr, $cutoff:expr $(,)?) => {{
         let mut layers = [OscillatorLayer {
             waveform: $waveform,
             level: $layer_level,
@@ -112,7 +136,7 @@ macro_rules! preset {
                 decay_ms: $decay,
                 sustain: $sustain,
                 release_ms: $release,
-                pitch_shift: 0,
+                pitch_shift: $pitch,
                 pan: 0.0,
                 mono: false,
                 glide_ms: 80.0,
@@ -125,7 +149,7 @@ macro_rules! preset {
 }
 
 impl SimpleWaveformSynth {
-    pub const PRESETS: [SynthPreset; 8] = [
+    pub const PRESETS: [SynthPreset; 14] = [
         preset!(
             "Bright lead",
             "Lead",
@@ -183,7 +207,7 @@ impl SimpleWaveformSynth {
             1_800.0,
         ),
         preset!(
-            "Synth drum",
+            "808-style kick",
             "Percussion",
             Waveform::Sine,
             1,
@@ -193,8 +217,37 @@ impl SimpleWaveformSynth {
             35.0,
             0.0,
             70.0,
+            -24,
             FilterKind::LowPass,
             2_500.0,
+        ),
+        preset!(
+            "Snare drum",
+            "Percussion",
+            Waveform::Noise,
+            2,
+            9.0,
+            0.7,
+            0.0,
+            95.0,
+            0.0,
+            140.0,
+            FilterKind::BandPass,
+            2_400.0,
+        ),
+        preset!(
+            "Closed hi-hat",
+            "Percussion",
+            Waveform::Noise,
+            2,
+            20.0,
+            0.5,
+            0.0,
+            22.0,
+            0.0,
+            35.0,
+            FilterKind::HighPass,
+            7_500.0,
         ),
         preset!(
             "Noise hit",
@@ -237,6 +290,62 @@ impl SimpleWaveformSynth {
             260.0,
             FilterKind::BandPass,
             2_200.0,
+        ),
+        preset!(
+            "Violin",
+            "Strings",
+            Waveform::Sawtooth,
+            3,
+            5.0,
+            0.55,
+            90.0,
+            320.0,
+            0.72,
+            450.0,
+            FilterKind::LowPass,
+            4_800.0,
+        ),
+        preset!(
+            "Synth strings",
+            "Strings",
+            Waveform::Sawtooth,
+            4,
+            14.0,
+            0.45,
+            240.0,
+            700.0,
+            0.68,
+            1_100.0,
+            FilterKind::LowPass,
+            3_600.0,
+        ),
+        preset!(
+            "Ambient pad",
+            "Pad",
+            Waveform::Sine,
+            4,
+            12.0,
+            0.55,
+            900.0,
+            1_200.0,
+            0.72,
+            2_800.0,
+            FilterKind::LowPass,
+            2_800.0,
+        ),
+        preset!(
+            "Voice-like pad",
+            "Pad",
+            Waveform::Square,
+            3,
+            7.0,
+            0.4,
+            650.0,
+            900.0,
+            0.66,
+            2_200.0,
+            FilterKind::BandPass,
+            1_250.0,
         ),
     ];
 }
@@ -357,7 +466,7 @@ impl Track {
             next_note_id: 1,
             next_clip_id: 1,
         };
-        track.add_clip(0, 8);
+        track.add_clip(0, 16);
         track
     }
 
@@ -388,7 +497,7 @@ impl Track {
 
     pub fn ensure_pattern_clip(&mut self) {
         if self.clips.is_empty() {
-            self.add_clip(0, 32);
+            self.add_clip(0, PATTERN_STEPS);
         }
     }
 }
@@ -433,7 +542,7 @@ impl Project {
             id: source_id,
             track_id: id,
             name: format!("Pattern {number}"),
-            length_steps: 32,
+            length_steps: PATTERN_STEPS,
             kind: ClipSourceKind::Pattern,
         });
         self.tracks.push(Track::instrument(id, source_id, name));
@@ -454,7 +563,7 @@ impl Project {
             id: source_id,
             track_id: id,
             name,
-            length_steps: 8,
+            length_steps: 16,
             kind: ClipSourceKind::Sample { path: path.clone() },
         });
         self.tracks.push(Track::sample(id, source_id, path));
@@ -468,7 +577,7 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{Project, SimpleWaveformSynth, Track, Waveform};
+    use super::{PATTERN_STEPS, Project, SimpleWaveformSynth, Track, Waveform};
 
     #[test]
     fn synth_defaults_to_one_layer_and_presets_respect_the_four_layer_cap() {
@@ -478,6 +587,21 @@ mod tests {
                 .iter()
                 .all(|preset| (1..=4).contains(&preset.synth.layer_count))
         );
+        for expected in [
+            "808-style kick",
+            "Snare drum",
+            "Closed hi-hat",
+            "Violin",
+            "Synth strings",
+            "Ambient pad",
+            "Voice-like pad",
+        ] {
+            assert!(
+                SimpleWaveformSynth::PRESETS
+                    .iter()
+                    .any(|preset| preset.name == expected)
+            );
+        }
     }
 
     #[test]
@@ -513,7 +637,7 @@ mod tests {
 
         assert_eq!(track.clips.len(), 1);
         assert_eq!(track.clips[0].start_step, 0);
-        assert_eq!(track.clips[0].length_steps, 32);
+        assert_eq!(track.clips[0].length_steps, PATTERN_STEPS);
     }
 
     /// Trimming an arrangement instance never changes its reusable library source.
@@ -527,7 +651,7 @@ mod tests {
 
         assert_eq!(
             project.source(source_id).map(|source| source.length_steps),
-            Some(32)
+            Some(PATTERN_STEPS)
         );
         assert_eq!(project.tracks[0].clips[0].length_steps, 8);
     }
