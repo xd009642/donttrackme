@@ -16,23 +16,23 @@ enum View {
 }
 
 const PIANO_KEYS: [(egui::Key, u8); 37] = [
-    (egui::Key::Z, 36),
-    (egui::Key::S, 37),
-    (egui::Key::X, 38),
-    (egui::Key::D, 39),
-    (egui::Key::C, 40),
-    (egui::Key::V, 41),
-    (egui::Key::G, 42),
-    (egui::Key::B, 43),
-    (egui::Key::H, 44),
-    (egui::Key::N, 45),
-    (egui::Key::J, 46),
-    (egui::Key::M, 47),
-    (egui::Key::Comma, 48),
-    (egui::Key::L, 49),
-    (egui::Key::Period, 50),
-    (egui::Key::Semicolon, 51),
-    (egui::Key::Slash, 52),
+    (egui::Key::Z, 43),
+    (egui::Key::S, 44),
+    (egui::Key::X, 45),
+    (egui::Key::D, 46),
+    (egui::Key::C, 47),
+    (egui::Key::V, 48),
+    (egui::Key::G, 49),
+    (egui::Key::B, 50),
+    (egui::Key::H, 51),
+    (egui::Key::N, 52),
+    (egui::Key::M, 53),
+    (egui::Key::L, 54),
+    (egui::Key::Comma, 55),
+    (egui::Key::Semicolon, 56),
+    (egui::Key::Period, 57),
+    (egui::Key::Quote, 58),
+    (egui::Key::Slash, 59),
     (egui::Key::Q, 60),
     (egui::Key::Num2, 61),
     (egui::Key::W, 62),
@@ -677,7 +677,8 @@ impl DawApp {
         });
         ui.separator();
         if matches!(track.kind, TrackKind::Instrument { .. }) {
-            self.piano_roll.show(ui, selected, track);
+            self.piano_roll
+                .show(ui, selected, track, &self.auditioned_notes);
         } else {
             ui.label("Sample tracks do not have a piano roll.");
         }
@@ -843,5 +844,27 @@ impl eframe::App for DawApp {
                 Color32::WHITE,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PIANO_KEYS;
+    use eframe::egui::Key;
+
+    #[test]
+    fn typing_keyboard_is_continuous_at_the_row_boundary() {
+        let pitch = |key| {
+            PIANO_KEYS
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, pitch)| *pitch)
+                .expect("tested key is part of the piano mapping")
+        };
+
+        assert_eq!(pitch(Key::Slash), 59);
+        assert_eq!(pitch(Key::Q), 60);
+        assert_eq!(pitch(Key::Num2), 61);
+        assert_eq!(pitch(Key::W), 62);
     }
 }

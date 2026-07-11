@@ -43,7 +43,13 @@ pub struct PianoRoll {
 }
 
 impl PianoRoll {
-    pub fn show(&mut self, ui: &mut egui::Ui, track_id: u64, track: &mut Track) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        track_id: u64,
+        track: &mut Track,
+        auditioned_notes: &HashSet<u8>,
+    ) {
         if self.track_id != Some(track_id) {
             self.selected.clear();
             self.drag = None;
@@ -59,7 +65,7 @@ impl PianoRoll {
             ui.separator();
             ui.weak("Ctrl/Cmd+C, X, V · Delete");
         });
-        ui.weak("Play: Z = C2 · S = C#2 · Q = C4 · number row supplies upper black notes");
+        ui.weak("Play: Z…/ and Q…] are consecutive white keys · / = B3 · Q = C4");
 
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             let grid_height = KEY_HEIGHT * f32::from(PITCH_COUNT);
@@ -90,7 +96,7 @@ impl PianoRoll {
             self.handle_click(ui, &response, grid, velocity, track);
             self.begin_drag(ui, &response, grid, velocity, track);
             self.update_drag(&response, grid, velocity, track);
-            self.paint_keyboard(&painter, rect);
+            self.paint_keyboard(&painter, rect, track, auditioned_notes);
             self.paint_grid(&painter, grid);
             self.paint_notes(&painter, grid, track);
             self.paint_velocity(&painter, velocity, track);
@@ -357,7 +363,19 @@ impl PianoRoll {
         }
     }
 
-    fn paint_keyboard(&self, painter: &egui::Painter, rect: Rect) {
+    fn paint_keyboard(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        track: &Track,
+        auditioned_notes: &HashSet<u8>,
+    ) {
+        let selected_pitches = track
+            .notes
+            .iter()
+            .filter(|note| self.selected.contains(&note.id))
+            .map(|note| note.pitch)
+            .collect::<HashSet<_>>();
         for row in 0..PITCH_COUNT {
             let pitch = LOWEST_PITCH + PITCH_COUNT - 1 - row;
             let key = Rect::from_min_size(
@@ -365,7 +383,14 @@ impl PianoRoll {
                 Vec2::new(KEYBOARD_WIDTH, KEY_HEIGHT),
             );
             let black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
-            painter.rect_filled(key, 0.0, Color32::from_gray(if black { 45 } else { 210 }));
+            let fill = if auditioned_notes.contains(&pitch) {
+                Color32::from_rgb(68, 164, 119)
+            } else if selected_pitches.contains(&pitch) {
+                Color32::from_rgb(205, 133, 48)
+            } else {
+                Color32::from_gray(if black { 45 } else { 210 })
+            };
+            painter.rect_filled(key, 0.0, fill);
             painter.rect_stroke(
                 key,
                 0.0,
@@ -377,7 +402,7 @@ impl PianoRoll {
                 egui::Align2::CENTER_CENTER,
                 note_name(pitch),
                 egui::FontId::monospace(11.0),
-                if black {
+                if black || auditioned_notes.contains(&pitch) || selected_pitches.contains(&pitch) {
                     Color32::WHITE
                 } else {
                     Color32::BLACK
