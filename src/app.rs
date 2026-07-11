@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
-    model::{Project, TrackKind, Waveform},
+    model::{Clip, ClipSourceKind, Project, TrackKind, Waveform},
     piano_roll,
 };
 
@@ -35,6 +35,7 @@ pub struct DawApp {
     piano_roll: piano_roll::PianoRoll,
     selected_clip: Option<(u64, u64)>,
     clip_drag: Option<ClipDrag>,
+    clip_clipboard: Option<Clip>,
 }
 
 impl DawApp {
@@ -48,6 +49,7 @@ impl DawApp {
             piano_roll: piano_roll::PianoRoll::default(),
             selected_clip: None,
             clip_drag: None,
+            clip_clipboard: None,
         }
     }
 
@@ -126,7 +128,7 @@ impl DawApp {
                     let selected = self.selected_track == Some(track.id);
                     let icon = match track.kind {
                         TrackKind::Instrument { .. } => "⌁",
-                        TrackKind::Sample { .. } => "▰",
+                        TrackKind::Sample => "▰",
                     };
                     egui::Frame::new()
                         .fill(if selected {
@@ -159,6 +161,59 @@ impl DawApp {
                 if self.project.tracks.is_empty() {
                     ui.weak("Add an instrument or drop an audio file here.");
                 }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Clip library");
+                ui.weak("Reusable originals");
+                let mut add_source = None;
+                for source in &self.project.clip_library {
+                    ui.horizontal(|ui| {
+                        ui.label(match &source.kind {
+                            ClipSourceKind::Pattern => "▦",
+                            ClipSourceKind::Sample { .. } => "▰",
+                        });
+                        let details = match &source.kind {
+                            ClipSourceKind::Pattern => {
+                                format!("Original length: {} steps", source.length_steps)
+                            }
+                            ClipSourceKind::Sample { path } => format!(
+                                "{}\nOriginal length: {} steps",
+                                path.display(),
+                                source.length_steps
+                            ),
+                        };
+                        ui.label(&source.name).on_hover_text(details);
+                        if ui
+                            .small_button("+")
+                            .on_hover_text("Add to arrangement")
+                            .clicked()
+                        {
+                            add_source = Some((source.track_id, source.id, source.length_steps));
+                        }
+                    });
+                }
+                if let Some((track_id, source_id, length)) = add_source
+                    && let Some(track) = self
+                        .project
+                        .tracks
+                        .iter_mut()
+                        .find(|track| track.id == track_id)
+                {
+                    let start = track
+                        .clips
+                        .iter()
+                        .map(|clip| clip.start_step + clip.length_steps)
+                        .max()
+                        .unwrap_or(0);
+                    let id = track.add_clip(start.min(127), length.min(128 - start.min(127)));
+                    debug_assert_eq!(
+                        track.clips.last().map(|clip| clip.source_id),
+                        Some(source_id)
+                    );
+                    self.selected_clip = Some((track_id, id));
+                    self.view = View::Arrangement;
+                }
             });
     }
 
@@ -168,14 +223,27 @@ impl DawApp {
         const TRACK_HEIGHT: f32 = 58.0;
         const HANDLE_WIDTH: f32 = 7.0;
 
-        let (duplicate, delete) = ui.input(|input| {
+        let (copy, cut, paste, duplicate, delete) = ui.input(|input| {
             (
+                input.modifiers.command && input.key_pressed(egui::Key::C),
+                input.modifiers.command && input.key_pressed(egui::Key::X),
+                input.modifiers.command && input.key_pressed(egui::Key::V),
                 input.modifiers.command && input.key_pressed(egui::Key::D),
                 input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
             )
         });
         if let Some((track_id, clip_id)) = self.selected_clip {
-            if delete
+            if (copy || cut)
+                && let Some(track) = self
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == track_id)
+                && let Some(clip) = track.clips.iter().find(|clip| clip.id == clip_id)
+            {
+                self.clip_clipboard = Some(clip.clone());
+            }
+            if (delete || cut)
                 && let Some(track) = self
                     .project
                     .tracks
@@ -197,16 +265,38 @@ impl DawApp {
                 self.selected_clip = Some((track_id, id));
             }
         }
+        if paste
+            && let Some(copied) = self.clip_clipboard.clone()
+            && let Some(track_id) = self
+                .project
+                .source(copied.source_id)
+                .map(|source| source.track_id)
+            && let Some(track) = self
+                .project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+        {
+            let start = (copied.start_step + copied.length_steps).min(STEPS - 1);
+            let id = track.add_clip(start, copied.length_steps.min(STEPS - start));
+            let pasted = track
+                .clips
+                .last_mut()
+                .expect("add_clip just inserted a clip");
+            pasted.source_id = copied.source_id;
+            self.selected_clip = Some((track_id, id));
+        }
 
         ui.horizontal(|ui| {
             ui.heading("Arrangement");
             ui.separator();
             ui.label("8 bars · 4/4");
             ui.separator();
-            ui.weak("Drag clips to move · right edge to resize · double-click pattern to edit · Ctrl/Cmd+D to duplicate");
+            ui.weak("Drag to move · right edge to trim · double-click pattern to edit · Ctrl/Cmd+C, X, V, D");
         });
         ui.add_space(8.0);
 
+        let clip_library = self.project.clip_library.clone();
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.set_min_width(180.0 + STEP_WIDTH * f32::from(STEPS));
             ui.horizontal(|ui| {
@@ -242,7 +332,7 @@ impl DawApp {
                                 .max()
                                 .unwrap_or(0);
                             if start < STEPS {
-                                let id = track.add_clip(start, 16_u16.min(STEPS - start));
+                                let id = track.add_clip(start, 32_u16.min(STEPS - start));
                                 self.selected_clip = Some((track.id, id));
                             }
                         }
@@ -369,16 +459,13 @@ impl DawApp {
                     for clip in &track.clips {
                         let area = clip_rect(clip.start_step, clip.length_steps);
                         let selected = self.selected_clip == Some((track.id, clip.id));
-                        let clip_label = match &track.kind {
-                            TrackKind::Sample { path } => path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or(&clip.name),
-                            TrackKind::Instrument { .. } => &clip.name,
-                        };
+                        let source = clip_library
+                            .iter()
+                            .find(|source| source.id == clip.source_id)
+                            .expect("every clip instance references a library source");
                         let color = match track.kind {
                             TrackKind::Instrument { .. } => Color32::from_rgb(68, 142, 112),
-                            TrackKind::Sample { .. } => Color32::from_rgb(70, 101, 157),
+                            TrackKind::Sample => Color32::from_rgb(70, 101, 157),
                         };
                         ui.painter().rect_filled(
                             area,
@@ -400,7 +487,7 @@ impl DawApp {
                         ui.painter().text(
                             area.left_top() + egui::vec2(7.0, 6.0),
                             egui::Align2::LEFT_TOP,
-                            clip_label,
+                            &source.name,
                             egui::FontId::proportional(12.0),
                             Color32::WHITE,
                         );
@@ -409,8 +496,7 @@ impl DawApp {
                         {
                             let baseline = area.bottom() - 6.0;
                             for note in &track.notes {
-                                let x =
-                                    area.left() + area.width() * f32::from(note.start_step) / 32.0;
+                                let x = area.left() + f32::from(note.start_step) * STEP_WIDTH;
                                 if x < area.right() - 3.0 {
                                     let y =
                                         baseline - f32::from(note.pitch.saturating_sub(48)) * 0.65;
