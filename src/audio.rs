@@ -1031,25 +1031,63 @@ fn sampler_frame(
         return None;
     }
     let position = elapsed as f32 * playback_rate * sample.sample_rate / output_sample_rate;
-    if position >= (end - start) as f32 {
+    let length = (end - start) as f32;
+    let position = if sampler.looping {
+        match sampler.loop_mode {
+            crate::model::SampleLoopMode::Forward => position % length,
+            crate::model::SampleLoopMode::PingPong => {
+                let span = (length - 1.0).max(0.0);
+                if span == 0.0 {
+                    0.0
+                } else {
+                    let phase = position % (span * 2.0);
+                    if phase <= span {
+                        phase
+                    } else {
+                        span * 2.0 - phase
+                    }
+                }
+            }
+        }
+    } else if position >= length {
         return None;
-    }
+    } else {
+        position
+    };
     let source_position = if sampler.reverse {
         end as f32 - 1.0 - position
     } else {
         start as f32 + position
     };
     let first = source_position.floor() as usize;
-    let second = if sampler.reverse {
-        first.saturating_sub(1).max(start)
-    } else {
-        (first + 1).min(end - 1)
-    };
+    let second = (first + 1).min(end - 1);
     let fraction = source_position.fract();
     Some([
         sample.frames[first][0] + (sample.frames[second][0] - sample.frames[first][0]) * fraction,
         sample.frames[first][1] + (sample.frames[second][1] - sample.frames[first][1]) * fraction,
     ])
+}
+
+pub(crate) fn load_waveform_preview(path: &Path, columns: usize) -> Result<Vec<[f32; 2]>, String> {
+    let sample = load_wav(path)?;
+    if sample.frames.is_empty() || columns == 0 {
+        return Ok(Vec::new());
+    }
+    let preview_columns = columns.min(sample.frames.len());
+    let mut preview = Vec::with_capacity(preview_columns);
+    for column in 0..preview_columns {
+        let start = column * sample.frames.len() / preview_columns;
+        let end = ((column + 1) * sample.frames.len() / preview_columns).max(start + 1);
+        let mut minimum = 1.0_f32;
+        let mut maximum = -1.0_f32;
+        for frame in &sample.frames[start..end.min(sample.frames.len())] {
+            let mono = (frame[0] + frame[1]) * 0.5;
+            minimum = minimum.min(mono);
+            maximum = maximum.max(mono);
+        }
+        preview.push([minimum, maximum]);
+    }
+    Ok(preview)
 }
 
 fn load_wav(path: &Path) -> Result<SampleBuffer, String> {
@@ -1339,6 +1377,32 @@ mod tests {
         assert_eq!(
             sampler_frame(&sample, &sampler, 0, 1.0, 4.0),
             Some([0.5, 0.5])
+        );
+    }
+
+    #[test]
+    fn sampler_loop_modes_restart_or_bounce_inside_the_trimmed_region() {
+        let sample = SampleBuffer {
+            frames: vec![[0.0, 0.0], [0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
+            sample_rate: 4.0,
+        };
+        let mut sampler = crate::model::SampleSynth {
+            looping: true,
+            ..crate::model::SampleSynth::default()
+        };
+
+        assert_eq!(
+            sampler_frame(&sample, &sampler, 4, 1.0, 4.0),
+            Some([0.0, 0.0])
+        );
+        sampler.loop_mode = crate::model::SampleLoopMode::PingPong;
+        assert_eq!(
+            sampler_frame(&sample, &sampler, 4, 1.0, 4.0),
+            Some([0.5, 0.5])
+        );
+        assert_eq!(
+            sampler_frame(&sample, &sampler, 6, 1.0, 4.0),
+            Some([0.0, 0.0])
         );
     }
 

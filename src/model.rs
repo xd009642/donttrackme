@@ -163,6 +163,8 @@ pub struct SampleSynth {
     pub trim_end: f32,
     pub speed: f32,
     pub reverse: bool,
+    pub looping: bool,
+    pub loop_mode: SampleLoopMode,
     pub gain: f32,
     pub pan: f32,
     pub attack_ms: f32,
@@ -170,6 +172,21 @@ pub struct SampleSynth {
     pub filter: FilterKind,
     pub filter_cutoff_hz: f32,
     pub filter_resonance: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SampleLoopMode {
+    Forward,
+    PingPong,
+}
+
+impl SampleLoopMode {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Forward => "Forward",
+            Self::PingPong => "Bounce",
+        }
+    }
 }
 
 impl Default for SampleSynth {
@@ -181,6 +198,8 @@ impl Default for SampleSynth {
             trim_end: 1.0,
             speed: 1.0,
             reverse: false,
+            looping: false,
+            loop_mode: SampleLoopMode::Forward,
             gain: 0.8,
             pan: 0.0,
             attack_ms: 0.0,

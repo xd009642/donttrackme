@@ -10,7 +10,8 @@ use crate::{
     audio::{self, AudioEngine},
     model::{
         ARRANGEMENT_STEPS, Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Project,
-        STEPS_PER_BAR, STEPS_PER_BEAT, SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
+        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SimpleWaveformSynth, TrackKind, Waveform,
+        noise_sample,
     },
     piano_roll, project_io,
 };
@@ -112,6 +113,12 @@ enum ClipDrag {
     },
 }
 
+#[derive(Clone, Copy)]
+enum TrimHandle {
+    Start,
+    End,
+}
+
 pub struct DawApp {
     project: Project,
     selected_track: Option<u64>,
@@ -131,6 +138,9 @@ pub struct DawApp {
     synth_mouse_pitch: Option<u8>,
     tap_tempo: TapTempo,
     space_was_down: bool,
+    sampler_waveform_path: Option<PathBuf>,
+    sampler_waveform: Vec<[f32; 2]>,
+    sampler_trim_drag: Option<TrimHandle>,
 }
 
 impl DawApp {
@@ -159,6 +169,9 @@ impl DawApp {
             synth_mouse_pitch: None,
             tap_tempo: TapTempo::default(),
             space_was_down: false,
+            sampler_waveform_path: None,
+            sampler_waveform: Vec::new(),
+            sampler_trim_drag: None,
         }
     }
 
@@ -1484,6 +1497,16 @@ impl DawApp {
         let TrackKind::Sampler { sampler } = &mut track.kind else {
             return;
         };
+        if self.sampler_waveform_path.as_ref() != sampler.path.as_ref() {
+            self.sampler_waveform_path = sampler.path.clone();
+            self.sampler_waveform.clear();
+            if let Some(path) = &sampler.path {
+                match audio::load_waveform_preview(path, 900) {
+                    Ok(preview) => self.sampler_waveform = preview,
+                    Err(error) => self.audio_error = Some(error),
+                }
+            }
+        }
         ui.horizontal(|ui| {
             ui.heading("Sampler");
             ui.separator();
@@ -1497,6 +1520,7 @@ impl DawApp {
         ui.add_space(12.0);
         let mut keyboard_output = SynthKeyboardOutput::default();
         let mut mouse_pitch = self.synth_mouse_pitch;
+        let mut trim_drag = self.sampler_trim_drag;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_max_width(920.0);
             egui::Frame::group(ui.style())
@@ -1523,6 +1547,9 @@ impl DawApp {
                         );
                     });
                     ui.add_space(8.0);
+                    sample_waveform_editor(ui, &self.sampler_waveform, sampler, &mut trim_drag);
+                    ui.weak("Click or drag near a marker to set the sample start or end point.");
+                    ui.add_space(8.0);
                     ui.add(
                         egui::Slider::new(&mut sampler.trim_start, 0.0..=sampler.trim_end - 0.001)
                             .text("Start"),
@@ -1531,7 +1558,24 @@ impl DawApp {
                         egui::Slider::new(&mut sampler.trim_end, sampler.trim_start + 0.001..=1.0)
                             .text("End"),
                     );
-                    ui.checkbox(&mut sampler.reverse, "Reverse");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut sampler.reverse, "Reverse");
+                        ui.checkbox(&mut sampler.looping, "Loop until note ends");
+                        ui.add_enabled_ui(sampler.looping, |ui| {
+                            egui::ComboBox::from_id_salt("sampler-loop-mode")
+                                .selected_text(sampler.loop_mode.name())
+                                .show_ui(ui, |ui| {
+                                    for mode in [SampleLoopMode::Forward, SampleLoopMode::PingPong]
+                                    {
+                                        ui.selectable_value(
+                                            &mut sampler.loop_mode,
+                                            mode,
+                                            mode.name(),
+                                        );
+                                    }
+                                });
+                        });
+                    });
                 });
             ui.add_space(10.0);
             egui::Frame::group(ui.style())
@@ -1610,6 +1654,7 @@ impl DawApp {
                 });
         });
         self.synth_mouse_pitch = mouse_pitch;
+        self.sampler_trim_drag = trim_drag;
         let audition_sampler = sampler.clone();
         if let Some(audio) = &self.audio {
             if let Some(pitch) = keyboard_output.note_off
@@ -1623,6 +1668,96 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
         }
+    }
+}
+
+fn sample_waveform_editor(
+    ui: &mut egui::Ui,
+    waveform: &[[f32; 2]],
+    sampler: &mut crate::model::SampleSynth,
+    trim_drag: &mut Option<TrimHandle>,
+) {
+    let width = ui.available_width().min(880.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::Vec2::new(width, 180.0), egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(22, 25, 31));
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_gray(55)),
+    );
+
+    if waveform.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Load a WAV to edit its waveform",
+            egui::FontId::proportional(14.0),
+            Color32::GRAY,
+        );
+    } else {
+        for (column, [minimum, maximum]) in waveform.iter().enumerate() {
+            let x = rect.left() + (column as f32 + 0.5) * rect.width() / waveform.len() as f32;
+            let top = rect.center().y - maximum * rect.height() * 0.46;
+            let bottom = rect.center().y - minimum * rect.height() * 0.46;
+            painter.line_segment(
+                [egui::pos2(x, top), egui::pos2(x, bottom)],
+                egui::Stroke::new(1.0, Color32::from_rgb(104, 190, 220)),
+            );
+        }
+    }
+
+    let start_x = rect.left() + sampler.trim_start * rect.width();
+    let end_x = rect.left() + sampler.trim_end * rect.width();
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(start_x, rect.bottom())),
+        0.0,
+        Color32::from_black_alpha(145),
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(end_x, rect.top()), rect.max),
+        0.0,
+        Color32::from_black_alpha(145),
+    );
+    for (x, label) in [(start_x, "START"), (end_x, "END")] {
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(2.0, Color32::from_rgb(255, 184, 77)),
+        );
+        painter.text(
+            egui::pos2(x, rect.top() + 5.0),
+            egui::Align2::CENTER_TOP,
+            label,
+            egui::FontId::monospace(11.0),
+            Color32::WHITE,
+        );
+    }
+
+    if (response.drag_started() || response.clicked())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *trim_drag = Some(
+            if (pointer.x - start_x).abs() <= (pointer.x - end_x).abs() {
+                TrimHandle::Start
+            } else {
+                TrimHandle::End
+            },
+        );
+    }
+    if (response.dragged() || response.clicked())
+        && let (Some(handle), Some(pointer)) = (*trim_drag, response.interact_pointer_pos())
+    {
+        let position = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        match handle {
+            TrimHandle::Start => sampler.trim_start = position.min(sampler.trim_end - 0.001),
+            TrimHandle::End => sampler.trim_end = position.max(sampler.trim_start + 0.001),
+        }
+    }
+    if response.drag_stopped() || response.clicked() {
+        *trim_drag = None;
     }
 }
 
