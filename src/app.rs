@@ -123,6 +123,13 @@ enum TrimHandle {
     End,
 }
 
+#[derive(Clone, Copy)]
+enum TimelineDrag {
+    New { start: f32 },
+    ResizeStart { end: f32 },
+    ResizeEnd { start: f32 },
+}
+
 pub struct DawApp {
     project: Project,
     selected_track: Option<u64>,
@@ -132,6 +139,9 @@ pub struct DawApp {
     transport_pattern: Option<u64>,
     transport_elapsed: Duration,
     transport_started: Option<Instant>,
+    transport_seek_pending: bool,
+    transport_loop_range: Option<(f32, f32)>,
+    timeline_drag: Option<TimelineDrag>,
     piano_roll: piano_roll::PianoRoll,
     selected_clip: Option<(u64, u64)>,
     clip_drag: Option<ClipDrag>,
@@ -169,6 +179,9 @@ impl DawApp {
             transport_pattern: None,
             transport_elapsed: Duration::ZERO,
             transport_started: None,
+            transport_seek_pending: false,
+            transport_loop_range: None,
+            timeline_drag: None,
             piano_roll: piano_roll::PianoRoll::default(),
             selected_clip: None,
             clip_drag: None,
@@ -397,13 +410,24 @@ impl DawApp {
                     self.playing = false;
                     self.transport_paused = true;
                 } else {
-                    if !self.transport_paused || desired_pattern != self.transport_pattern {
+                    if (!self.transport_paused || desired_pattern != self.transport_pattern)
+                        && !self.transport_seek_pending
+                    {
                         self.transport_elapsed = Duration::ZERO;
                     }
                     self.transport_started = Some(Instant::now());
                     self.playing = true;
                     self.transport_paused = false;
                     self.transport_pattern = desired_pattern;
+                    self.transport_seek_pending = false;
+                    let step = self
+                        .transport_step(self.transport_length_steps())
+                        .unwrap_or(0.0);
+                    if let Err(error) = audio.seek_step(self.project.bpm, step).and_then(|_| {
+                        audio.set_loop_steps(self.project.bpm, self.transport_loop_range)
+                    }) {
+                        self.audio_error = Some(error);
+                    }
                 }
                 self.audio_error = None;
             }
@@ -420,7 +444,179 @@ impl DawApp {
                 .transport_started
                 .map_or(Duration::ZERO, |started| started.elapsed());
         let seconds_per_step = 60.0 / self.project.bpm / f32::from(STEPS_PER_BEAT);
-        Some((elapsed.as_secs_f32() / seconds_per_step) % f32::from(length_steps))
+        let raw_step = elapsed.as_secs_f32() / seconds_per_step;
+        if let Some((start, end)) = self
+            .transport_loop_range
+            .filter(|(start, end)| start < end && *end <= f32::from(length_steps))
+            && raw_step >= end
+        {
+            Some(start + (raw_step - start) % (end - start))
+        } else {
+            Some(raw_step % f32::from(length_steps))
+        }
+    }
+
+    fn transport_length_steps(&self) -> u16 {
+        if self.view == View::PianoRoll {
+            self.current_pattern_id()
+                .and_then(|pattern_id| self.project.source(pattern_id))
+                .map_or(PATTERN_STEPS, |source| source.length_steps)
+        } else {
+            ARRANGEMENT_STEPS
+        }
+    }
+
+    fn seek_transport(&mut self, step: f32) {
+        let seconds_per_step = 60.0 / self.project.bpm / f32::from(STEPS_PER_BEAT);
+        self.transport_elapsed = Duration::from_secs_f32(step * seconds_per_step);
+        self.transport_started = self.playing.then(Instant::now);
+        self.transport_seek_pending = !self.playing && !self.transport_paused;
+        if let Some(audio) = &self.audio
+            && (self.playing || self.transport_paused)
+            && let Err(error) = audio.seek_step(self.project.bpm, step)
+        {
+            self.audio_error = Some(error);
+        }
+    }
+
+    fn transport_timeline(&mut self, ui: &mut egui::Ui) {
+        let length = self.transport_length_steps();
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 34.0),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
+        for step in (0..=length).step_by(usize::from(STEPS_PER_BAR)) {
+            let x = rect.left() + f32::from(step) / f32::from(length) * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, Color32::from_gray(75)),
+            );
+            painter.text(
+                egui::pos2(x + 4.0, rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                format!("{}", step / STEPS_PER_BAR + 1),
+                egui::FontId::monospace(10.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+        if let Some((start, end)) = self.transport_loop_range {
+            let left = rect.left() + start / f32::from(length) * rect.width();
+            let right = rect.left() + end / f32::from(length) * rect.width();
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left, rect.top()),
+                    egui::pos2(right, rect.bottom()),
+                ),
+                1.0,
+                Color32::from_rgba_premultiplied(73, 181, 132, 70),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(left, rect.top()),
+                    egui::pos2(left, rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, Color32::from_rgb(98, 220, 168)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right, rect.top()),
+                    egui::pos2(right, rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, Color32::from_rgb(98, 220, 168)),
+            );
+        }
+        let seconds_per_step = 60.0 / self.project.bpm / f32::from(STEPS_PER_BEAT);
+        let current = self.transport_step(length).unwrap_or_else(|| {
+            (self.transport_elapsed.as_secs_f32() / seconds_per_step) % f32::from(length)
+        });
+        let playhead_x = rect.left() + current / f32::from(length) * rect.width();
+        painter.line_segment(
+            [
+                egui::pos2(playhead_x, rect.top()),
+                egui::pos2(playhead_x, rect.bottom()),
+            ],
+            egui::Stroke::new(2.0, Color32::from_rgb(255, 92, 82)),
+        );
+
+        let pointer_step = response.interact_pointer_pos().map(|pointer| {
+            (((pointer.x - rect.left()) / rect.width()) * f32::from(length))
+                .clamp(0.0, f32::from(length))
+        });
+        if response.drag_started()
+            && let (Some(pointer), Some(step)) = (response.interact_pointer_pos(), pointer_step)
+        {
+            self.timeline_drag = Some(if let Some((start, end)) = self.transport_loop_range {
+                let start_x = rect.left() + start / f32::from(length) * rect.width();
+                let end_x = rect.left() + end / f32::from(length) * rect.width();
+                if (pointer.x - start_x).abs() <= 7.0 {
+                    TimelineDrag::ResizeStart { end }
+                } else if (pointer.x - end_x).abs() <= 7.0 {
+                    TimelineDrag::ResizeEnd { start }
+                } else {
+                    TimelineDrag::New { start: step }
+                }
+            } else {
+                TimelineDrag::New { start: step }
+            });
+        }
+        if response.dragged()
+            && let (Some(drag), Some(pointer)) = (self.timeline_drag, pointer_step)
+        {
+            let range = match drag {
+                TimelineDrag::New { start } if (pointer - start).abs() >= 0.25 => {
+                    Some((start.min(pointer), start.max(pointer)))
+                }
+                TimelineDrag::ResizeStart { end } if (end - pointer).abs() >= 0.25 => {
+                    Some((pointer.min(end), pointer.max(end)))
+                }
+                TimelineDrag::ResizeEnd { start } if (pointer - start).abs() >= 0.25 => {
+                    Some((start.min(pointer), start.max(pointer)))
+                }
+                _ => None,
+            };
+            if let Some(range) = range {
+                self.transport_loop_range = Some(range);
+                if let Some(audio) = &self.audio
+                    && let Err(error) = audio.set_loop_steps(self.project.bpm, Some(range))
+                {
+                    self.audio_error = Some(error);
+                }
+            }
+        }
+        if response.drag_stopped() {
+            if let Some((start, _)) = self.transport_loop_range {
+                self.seek_transport(start);
+            }
+            self.timeline_drag = None;
+        } else if response.clicked()
+            && let Some(step) = pointer_step
+        {
+            if self
+                .transport_loop_range
+                .is_some_and(|(start, end)| step < start || step > end)
+            {
+                self.transport_loop_range = None;
+                if let Some(audio) = &self.audio
+                    && let Err(error) = audio.set_loop_steps(self.project.bpm, None)
+                {
+                    self.audio_error = Some(error);
+                }
+            }
+            self.seek_transport(step.min(f32::from(length) - 0.001));
+        }
+        if response.double_clicked() {
+            self.transport_loop_range = None;
+            if let Some(audio) = &self.audio
+                && let Err(error) = audio.set_loop_steps(self.project.bpm, None)
+            {
+                self.audio_error = Some(error);
+            }
+        }
+        response.on_hover_text(
+            "Click to seek · click outside a loop to clear it · drag to select · drag loop edges to resize",
+        );
     }
 
     fn top_bar(&mut self, root: &mut egui::Ui) {
@@ -878,6 +1074,10 @@ impl DawApp {
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             ui.set_min_width(180.0 + STEP_WIDTH * f32::from(STEPS));
             ui.horizontal(|ui| {
+                ui.add_space(170.0);
+                self.transport_timeline(ui);
+            });
+            ui.horizontal(|ui| {
                 ui.add_sized([170.0, 24.0], egui::Label::new(""));
                 let (header, _) = ui.allocate_exact_size(
                     egui::vec2(STEP_WIDTH * f32::from(STEPS), 24.0),
@@ -1277,6 +1477,10 @@ impl DawApp {
         let playhead_step = (self.transport_pattern == Some(pattern_id))
             .then(|| self.transport_step(self.project.clip_library[source_index].length_steps))
             .flatten();
+        ui.horizontal(|ui| {
+            ui.add_space(78.0);
+            self.transport_timeline(ui);
+        });
         let (tracks, sources) = (&mut self.project.tracks, &mut self.project.clip_library);
         let track = &mut tracks[index];
 

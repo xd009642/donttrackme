@@ -27,6 +27,8 @@ enum Command {
     Stop,
     Pause,
     Resume,
+    Seek(u64),
+    SetLoopRange(Option<(u64, u64)>),
     AuditionStart {
         pitch: u8,
         synth: SimpleWaveformSynth,
@@ -188,6 +190,27 @@ impl AudioEngine {
     pub fn resume(&self) -> Result<(), String> {
         self.commands
             .send(Command::Resume)
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn seek_step(&self, bpm: f32, step: f32) -> Result<(), String> {
+        let sample =
+            (step * self.sample_rate * 60.0 / bpm / f32::from(STEPS_PER_BEAT)).round() as u64;
+        self.commands
+            .send(Command::Seek(sample))
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn set_loop_steps(&self, bpm: f32, range: Option<(f32, f32)>) -> Result<(), String> {
+        let samples_per_step = self.sample_rate * 60.0 / bpm / f32::from(STEPS_PER_BEAT);
+        let range = range.map(|(start, end)| {
+            (
+                (start * samples_per_step).round() as u64,
+                (end * samples_per_step).round() as u64,
+            )
+        });
+        self.commands
+            .send(Command::SetLoopRange(range))
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
@@ -638,6 +661,7 @@ struct Renderer {
     plan: Option<PlaybackPlan>,
     position: u64,
     paused: bool,
+    loop_range: Option<(u64, u64)>,
     sample_rate: f32,
     audition_voices: Vec<AuditionVoice>,
     audition_effects: Option<EffectChain>,
@@ -682,6 +706,7 @@ impl Renderer {
             plan: None,
             position: 0,
             paused: false,
+            loop_range: None,
             sample_rate,
             audition_voices: Vec::with_capacity(40),
             audition_effects: None,
@@ -726,6 +751,12 @@ impl Renderer {
                         self.paused = false;
                     }
                 }
+                Command::Seek(position) => {
+                    if let Some(plan) = &self.plan {
+                        self.position = position.min(plan.loop_samples.saturating_sub(1));
+                    }
+                }
+                Command::SetLoopRange(range) => self.loop_range = range,
                 Command::AuditionStart { pitch, synth } => self.start_audition(pitch, synth),
                 Command::AuditionFmStart { pitch, synth } => {
                     self.audition_fm.retain(|voice| voice.pitch != pitch);
@@ -947,8 +978,13 @@ impl Renderer {
                 output[1] += effected[1];
             }
             self.position += 1;
-            if self.position >= plan.loop_samples {
-                self.position = 0;
+            let loop_target = self
+                .loop_range
+                .filter(|(start, end)| start < end && *end <= plan.loop_samples);
+            if loop_target.is_some_and(|(_, end)| self.position >= end)
+                || self.position >= plan.loop_samples
+            {
+                self.position = loop_target.map_or(0, |(start, _)| start);
                 for channel in &mut plan.channels {
                     for voice in &mut channel.voices {
                         voice.filter = FilterState::default();
@@ -2079,5 +2115,23 @@ mod tests {
         renderer.next_frame();
 
         assert_eq!(renderer.position, paused_at);
+    }
+
+    #[test]
+    fn renderer_wraps_to_the_selected_loop_start() {
+        let mut project = Project::default();
+        project.add_instrument();
+        let pattern_id = project.tracks[0].source_id;
+        let plan = PlaybackPlan::from_pattern(&project, pattern_id, 48_000.0)
+            .expect("pattern should build a playback plan");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut renderer = super::Renderer::new(receiver, 48_000.0);
+        renderer.plan = Some(plan);
+        renderer.position = 3;
+        renderer.loop_range = Some((2, 4));
+
+        renderer.next_frame();
+
+        assert_eq!(renderer.position, 2);
     }
 }
