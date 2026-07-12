@@ -59,6 +59,7 @@ impl PianoRoll {
         pattern_id: u64,
         pattern: &mut Pattern,
         auditioned_notes: &HashSet<u8>,
+        playhead_step: Option<f32>,
     ) -> PianoRollOutput {
         let mut output = PianoRollOutput::default();
         if self.pattern_id != Some(pattern_id) {
@@ -131,6 +132,13 @@ impl PianoRoll {
             self.paint_grid(&painter, grid);
             self.paint_notes(&painter, grid, pattern);
             self.paint_velocity(&painter, velocity, pattern);
+            if let Some(step) = playhead_step {
+                let x = grid.left() + step * STEP_WIDTH;
+                painter.line_segment(
+                    [Pos2::new(x, grid.top()), Pos2::new(x, velocity.bottom())],
+                    Stroke::new(2.0, Color32::from_rgb(255, 92, 82)),
+                );
+            }
 
             if let Some(Drag::Marquee { origin, .. }) = self.drag
                 && let Some(pointer) = response.interact_pointer_pos()

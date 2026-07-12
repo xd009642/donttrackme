@@ -130,6 +130,8 @@ pub struct DawApp {
     playing: bool,
     transport_paused: bool,
     transport_pattern: Option<u64>,
+    transport_elapsed: Duration,
+    transport_started: Option<Instant>,
     piano_roll: piano_roll::PianoRoll,
     selected_clip: Option<(u64, u64)>,
     clip_drag: Option<ClipDrag>,
@@ -165,6 +167,8 @@ impl DawApp {
             playing: false,
             transport_paused: false,
             transport_pattern: None,
+            transport_elapsed: Duration::ZERO,
+            transport_started: None,
             piano_roll: piano_roll::PianoRoll::default(),
             selected_clip: None,
             clip_drag: None,
@@ -319,6 +323,8 @@ impl DawApp {
                 self.playing = false;
                 self.transport_paused = false;
                 self.transport_pattern = None;
+                self.transport_elapsed = Duration::ZERO;
+                self.transport_started = None;
                 self.view = View::Arrangement;
                 self.project_path = Some(path);
                 self.project_status = Some("Project loaded".to_owned());
@@ -385,9 +391,16 @@ impl DawApp {
         match result {
             Ok(()) => {
                 if self.playing {
+                    if let Some(started) = self.transport_started.take() {
+                        self.transport_elapsed += started.elapsed();
+                    }
                     self.playing = false;
                     self.transport_paused = true;
                 } else {
+                    if !self.transport_paused || desired_pattern != self.transport_pattern {
+                        self.transport_elapsed = Duration::ZERO;
+                    }
+                    self.transport_started = Some(Instant::now());
                     self.playing = true;
                     self.transport_paused = false;
                     self.transport_pattern = desired_pattern;
@@ -396,6 +409,18 @@ impl DawApp {
             }
             Err(error) => self.audio_error = Some(error),
         }
+    }
+
+    fn transport_step(&self, length_steps: u16) -> Option<f32> {
+        if !self.playing && !self.transport_paused {
+            return None;
+        }
+        let elapsed = self.transport_elapsed
+            + self
+                .transport_started
+                .map_or(Duration::ZERO, |started| started.elapsed());
+        let seconds_per_step = 60.0 / self.project.bpm / f32::from(STEPS_PER_BEAT);
+        Some((elapsed.as_secs_f32() / seconds_per_step) % f32::from(length_steps))
     }
 
     fn top_bar(&mut self, root: &mut egui::Ui) {
@@ -439,6 +464,8 @@ impl DawApp {
                             self.playing = false;
                             self.transport_paused = false;
                             self.transport_pattern = None;
+                            self.transport_elapsed = Duration::ZERO;
+                            self.transport_started = None;
                         }
                         Err(error) => self.audio_error = Some(error),
                     }
@@ -742,6 +769,7 @@ impl DawApp {
         const STEP_WIDTH: f32 = 12.0;
         const TRACK_HEIGHT: f32 = 58.0;
         const HANDLE_WIDTH: f32 = 7.0;
+        let playhead_step = self.transport_step(STEPS);
 
         let (copy, cut, paste, duplicate, delete) = ui.input(|input| {
             (
@@ -1099,6 +1127,13 @@ impl DawApp {
                             }
                         }
                     }
+                    if let Some(step) = playhead_step {
+                        let x = rect.left() + step * STEP_WIDTH;
+                        ui.painter().line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(2.0, Color32::from_rgb(255, 92, 82)),
+                        );
+                    }
                 });
                 ui.add_space(4.0);
             }
@@ -1239,6 +1274,9 @@ impl DawApp {
             ui.label("This pattern is no longer in the clip library.");
             return;
         };
+        let playhead_step = (self.transport_pattern == Some(pattern_id))
+            .then(|| self.transport_step(self.project.clip_library[source_index].length_steps))
+            .flatten();
         let (tracks, sources) = (&mut self.project.tracks, &mut self.project.clip_library);
         let track = &mut tracks[index];
 
@@ -1284,9 +1322,13 @@ impl DawApp {
                 &track.kind,
                 &mut self.automation_articulation_brush,
             );
-            let output = self
-                .piano_roll
-                .show(ui, pattern_id, pattern, &self.auditioned_notes);
+            let output = self.piano_roll.show(
+                ui,
+                pattern_id,
+                pattern,
+                &self.auditioned_notes,
+                playhead_step,
+            );
             if let Some(audio) = &self.audio {
                 if let Some(pitch) = output.note_off
                     && let Err(error) = audio.audition_stop(pitch)
@@ -2996,6 +3038,9 @@ impl eframe::App for DawApp {
             View::Instrument => self.instrument_settings(ui),
         });
         self.tap_tempo_window(&context);
+        if self.playing {
+            context.request_repaint();
+        }
 
         if context.input(|input| !input.raw.hovered_files.is_empty()) {
             let painter = context.layer_painter(egui::LayerId::new(
