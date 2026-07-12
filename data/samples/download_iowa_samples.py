@@ -209,6 +209,9 @@ def main() -> int:
 
         for source in source_files:
             convert_to_wav(source, instrument_output / f"{source.stem}.wav")
+        # TODO: Split Iowa chromatic-scale recordings (for example C2B2) into individual
+        # note WAVs using onset/silence detection. The DAW intentionally refuses to map a
+        # whole scale recording as though it were one pitched sample.
         manifest.append(
             {
                 "instrument": name,

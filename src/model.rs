@@ -590,6 +590,71 @@ pub struct Note {
     pub velocity: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutomationParameter {
+    SamplerArticulation,
+    SamplerFilterCutoff,
+    SynthFilterCutoff,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AutomationValue {
+    Choice(String),
+    Continuous(f32),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutomationPoint {
+    pub step: u16,
+    pub value: AutomationValue,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutomationLane {
+    pub parameter: AutomationParameter,
+    pub points: Vec<AutomationPoint>,
+}
+
+impl AutomationLane {
+    pub fn value_at(&self, step: u16) -> Option<&AutomationValue> {
+        self.points
+            .iter()
+            .filter(|point| point.step <= step)
+            .max_by_key(|point| point.step)
+            .map(|point| &point.value)
+    }
+
+    pub fn continuous_value_at(&self, step: u16) -> Option<f32> {
+        let previous = self
+            .points
+            .iter()
+            .filter(|point| point.step <= step)
+            .filter_map(|point| match point.value {
+                AutomationValue::Continuous(value) => Some((point.step, value)),
+                AutomationValue::Choice(_) => None,
+            })
+            .max_by_key(|(point_step, _)| *point_step);
+        let next = self
+            .points
+            .iter()
+            .filter(|point| point.step > step)
+            .filter_map(|point| match point.value {
+                AutomationValue::Continuous(value) => Some((point.step, value)),
+                AutomationValue::Choice(_) => None,
+            })
+            .min_by_key(|(point_step, _)| *point_step);
+        match (previous, next) {
+            (Some((previous_step, previous_value)), Some((next_step, next_value))) => {
+                let progress =
+                    f32::from(step - previous_step) / f32::from(next_step - previous_step);
+                Some(previous_value + (next_value - previous_value) * progress)
+            }
+            (Some((_, value)), None) | (None, Some((_, value))) => Some(value),
+            (None, None) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: u64,
@@ -616,6 +681,7 @@ pub enum ClipSourceKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pattern {
     pub notes: Vec<Note>,
+    pub automation: Vec<AutomationLane>,
     next_note_id: u64,
 }
 
@@ -638,6 +704,7 @@ impl Default for Pattern {
     fn default() -> Self {
         Self {
             notes: Vec::new(),
+            automation: Vec::new(),
             next_note_id: 1,
         }
     }
@@ -894,7 +961,31 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::{PATTERN_STEPS, Pattern, Project, SimpleWaveformSynth, Waveform, noise_sample};
+    use super::{
+        AutomationLane, AutomationParameter, AutomationPoint, AutomationValue, PATTERN_STEPS,
+        Pattern, Project, SimpleWaveformSynth, Waveform, noise_sample,
+    };
+
+    #[test]
+    fn continuous_automation_interpolates_between_points() {
+        let lane = AutomationLane {
+            parameter: AutomationParameter::SynthFilterCutoff,
+            points: vec![
+                AutomationPoint {
+                    step: 4,
+                    value: AutomationValue::Continuous(100.0),
+                },
+                AutomationPoint {
+                    step: 12,
+                    value: AutomationValue::Continuous(500.0),
+                },
+            ],
+        };
+
+        assert_eq!(lane.continuous_value_at(0), Some(100.0));
+        assert_eq!(lane.continuous_value_at(8), Some(300.0));
+        assert_eq!(lane.continuous_value_at(16), Some(500.0));
+    }
 
     #[test]
     fn synth_defaults_to_one_layer_and_presets_respect_the_four_layer_cap() {

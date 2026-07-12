@@ -14,8 +14,9 @@ use cpal::{
 };
 
 use crate::model::{
-    ARRANGEMENT_STEPS, DEFAULT_EFFECTS, EffectKind, EffectSlot, FilterKind, Project,
-    STEPS_PER_BEAT, SampleSynth, SimpleWaveformSynth, TrackKind, noise_sample,
+    ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, DEFAULT_EFFECTS, EffectKind,
+    EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT, SampleSynth, SimpleWaveformSynth,
+    TrackKind, noise_sample,
 };
 
 enum Command {
@@ -67,6 +68,10 @@ struct Voice {
     gain: f32,
     filter: FilterState,
     sample: Option<Arc<SampleBuffer>>,
+    // TODO: Evaluate continuous automation throughout sustained notes. The first automation
+    // slice samples filter cutoff at note-on, which proves shared synth/sampler targeting but
+    // does not yet sweep a note that is already sounding.
+    automated_filter_cutoff: Option<f32>,
 }
 
 #[derive(Default)]
@@ -200,7 +205,9 @@ impl AudioEngine {
     }
 
     pub fn audition_sample_start(&self, pitch: u8, sampler: SampleSynth) -> Result<(), String> {
-        let Some((path, root_pitch)) = select_sample_region(&sampler, pitch, 127) else {
+        let Some((path, root_pitch)) =
+            select_sample_region(&sampler, pitch, 127, &sampler.articulation)
+        else {
             return Err("Load a WAV into the sampler first".to_owned());
         };
         let mut cache = self
@@ -347,6 +354,7 @@ impl PlaybackPlan {
                         gain: 1.0,
                         filter: FilterState::default(),
                         sample: Some(sample),
+                        automated_filter_cutoff: None,
                     });
                 }
             } else {
@@ -376,11 +384,17 @@ impl PlaybackPlan {
                                     pitch_frequency(note.pitch, synth.pitch_shift)
                                 }
                                 RenderInstrument::Sampler { sampler } => {
-                                    let (_, root_pitch) =
-                                        select_sample_region(sampler, note.pitch, note.velocity)
-                                            .expect(
-                                                "loaded sampler has at least one sample region",
-                                            );
+                                    let (_, root_pitch) = select_sample_region(
+                                        sampler,
+                                        note.pitch,
+                                        note.velocity,
+                                        pattern_articulation(
+                                            pattern,
+                                            note.start_step,
+                                            &sampler.articulation,
+                                        ),
+                                    )
+                                    .expect("loaded sampler has at least one sample region");
                                     2.0_f32.powf(
                                         (f32::from(note.pitch) - f32::from(root_pitch)) / 12.0,
                                     ) * sampler.speed
@@ -388,11 +402,17 @@ impl PlaybackPlan {
                             };
                             let sample = match &instrument {
                                 RenderInstrument::Sampler { sampler } => {
-                                    let (path, _) =
-                                        select_sample_region(sampler, note.pitch, note.velocity)
-                                            .expect(
-                                                "loaded sampler has at least one sample region",
-                                            );
+                                    let (path, _) = select_sample_region(
+                                        sampler,
+                                        note.pitch,
+                                        note.velocity,
+                                        pattern_articulation(
+                                            pattern,
+                                            note.start_step,
+                                            &sampler.articulation,
+                                        ),
+                                    )
+                                    .expect("loaded sampler has at least one sample region");
                                     if let Some(sample) = decoded_samples.get(path) {
                                         Some(Arc::clone(sample))
                                     } else {
@@ -414,6 +434,11 @@ impl PlaybackPlan {
                                 gain: f32::from(note.velocity) / 127.0,
                                 filter: FilterState::default(),
                                 sample,
+                                automated_filter_cutoff: pattern_filter_cutoff(
+                                    pattern,
+                                    note.start_step,
+                                    &instrument,
+                                ),
                             });
                         }
                     }
@@ -490,17 +515,26 @@ impl PlaybackPlan {
                         pitch_frequency(note.pitch, synth.pitch_shift)
                     }
                     RenderInstrument::Sampler { sampler } => {
-                        let (_, root_pitch) =
-                            select_sample_region(sampler, note.pitch, note.velocity)
-                                .expect("loaded sampler has at least one sample region");
+                        let (_, root_pitch) = select_sample_region(
+                            sampler,
+                            note.pitch,
+                            note.velocity,
+                            pattern_articulation(pattern, note.start_step, &sampler.articulation),
+                        )
+                        .expect("loaded sampler has at least one sample region");
                         2.0_f32.powf((f32::from(note.pitch) - f32::from(root_pitch)) / 12.0)
                             * sampler.speed
                     }
                 };
                 let sample = match &instrument {
                     RenderInstrument::Sampler { sampler } => {
-                        let (path, _) = select_sample_region(sampler, note.pitch, note.velocity)
-                            .expect("loaded sampler has at least one sample region");
+                        let (path, _) = select_sample_region(
+                            sampler,
+                            note.pitch,
+                            note.velocity,
+                            pattern_articulation(pattern, note.start_step, &sampler.articulation),
+                        )
+                        .expect("loaded sampler has at least one sample region");
                         if let Some(sample) = decoded_samples.get(path) {
                             Some(Arc::clone(sample))
                         } else {
@@ -521,6 +555,11 @@ impl PlaybackPlan {
                     gain: f32::from(note.velocity) / 127.0,
                     filter: FilterState::default(),
                     sample,
+                    automated_filter_cutoff: pattern_filter_cutoff(
+                        pattern,
+                        note.start_step,
+                        &instrument,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -763,7 +802,15 @@ impl Renderer {
                                     * envelope
                                     * voice.gain
                                     * synth.master_level;
-                            let filtered = voice.filter.process(raw, synth, self.sample_rate);
+                            let filtered = voice.filter.process_values(
+                                raw,
+                                synth.filter,
+                                voice
+                                    .automated_filter_cutoff
+                                    .unwrap_or(synth.filter_cutoff_hz),
+                                synth.filter_resonance,
+                                self.sample_rate,
+                            );
                             add_panned(&mut channel_output, filtered, synth.pan);
                         }
                     }
@@ -805,7 +852,9 @@ impl Renderer {
                             let filtered = voice.filter.process_values(
                                 mono,
                                 sampler.filter,
-                                sampler.filter_cutoff_hz,
+                                voice
+                                    .automated_filter_cutoff
+                                    .unwrap_or(sampler.filter_cutoff_hz),
                                 sampler.filter_resonance,
                                 self.sample_rate,
                             );
@@ -1139,11 +1188,45 @@ fn oscillator_sample(
         / f32::from(synth.layer_count)
 }
 
-fn select_sample_region(sampler: &SampleSynth, pitch: u8, velocity: u8) -> Option<(&Path, u8)> {
+fn pattern_articulation<'a>(pattern: &'a Pattern, step: u16, default: &'a str) -> &'a str {
+    pattern
+        .automation
+        .iter()
+        .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation)
+        .and_then(|lane| lane.value_at(step))
+        .and_then(|value| match value {
+            AutomationValue::Choice(articulation) => Some(articulation.as_str()),
+            AutomationValue::Continuous(_) => None,
+        })
+        .unwrap_or(default)
+}
+
+fn pattern_filter_cutoff(
+    pattern: &Pattern,
+    step: u16,
+    instrument: &RenderInstrument,
+) -> Option<f32> {
+    let parameter = match instrument {
+        RenderInstrument::Synth(_) => AutomationParameter::SynthFilterCutoff,
+        RenderInstrument::Sampler { .. } => AutomationParameter::SamplerFilterCutoff,
+    };
+    pattern
+        .automation
+        .iter()
+        .find(|lane| lane.parameter == parameter)
+        .and_then(|lane| lane.continuous_value_at(step))
+}
+
+fn select_sample_region<'a>(
+    sampler: &'a SampleSynth,
+    pitch: u8,
+    velocity: u8,
+    articulation: &str,
+) -> Option<(&'a Path, u8)> {
     let matching_velocity = sampler
         .regions
         .iter()
-        .filter(|region| region.articulation == sampler.articulation)
+        .filter(|region| region.articulation == articulation)
         .filter(|region| (region.key_min..=region.key_max).contains(&pitch))
         .filter(|region| (region.velocity_min..=region.velocity_max).contains(&velocity));
     if let Some(region) = matching_velocity.min_by_key(|region| region.root_pitch.abs_diff(pitch)) {
@@ -1152,7 +1235,7 @@ fn select_sample_region(sampler: &SampleSynth, pitch: u8, velocity: u8) -> Optio
     sampler
         .regions
         .iter()
-        .filter(|region| region.articulation == sampler.articulation)
+        .filter(|region| region.articulation == articulation)
         .min_by_key(|region| region.root_pitch.abs_diff(pitch))
         .map(|region| (region.path.as_path(), region.root_pitch))
         .or_else(|| {
@@ -1306,12 +1389,12 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 mod tests {
     use super::{
         EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
-        glide_frequency, held_envelope, held_sample_envelope, note_envelope, pitch_frequency,
-        sampler_frame, select_sample_region,
+        glide_frequency, held_envelope, held_sample_envelope, note_envelope, pattern_articulation,
+        pitch_frequency, sampler_frame, select_sample_region,
     };
     use crate::model::{
-        DEFAULT_EFFECTS, EffectKind, Project, SampleRegion, SampleSynth, SimpleWaveformSynth,
-        TrackKind,
+        AutomationLane, AutomationParameter, AutomationPoint, AutomationValue, DEFAULT_EFFECTS,
+        EffectKind, Pattern, Project, SampleRegion, SampleSynth, SimpleWaveformSynth, TrackKind,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1351,10 +1434,32 @@ mod tests {
             ..SampleSynth::default()
         };
 
-        let (path, root) = select_sample_region(&sampler, 65, 100)
+        let (path, root) = select_sample_region(&sampler, 65, 100, "Standard")
             .expect("a matching multisample region should exist");
         assert_eq!(path, std::path::Path::new("loud-g4.wav"));
         assert_eq!(root, 67);
+    }
+
+    #[test]
+    fn articulation_automation_latches_until_the_next_event() {
+        let mut pattern = Pattern::default();
+        pattern.automation.push(AutomationLane {
+            parameter: AutomationParameter::SamplerArticulation,
+            points: vec![
+                AutomationPoint {
+                    step: 4,
+                    value: AutomationValue::Choice("pizz".to_owned()),
+                },
+                AutomationPoint {
+                    step: 12,
+                    value: AutomationValue::Choice("arco".to_owned()),
+                },
+            ],
+        });
+
+        assert_eq!(pattern_articulation(&pattern, 0, "arco"), "arco");
+        assert_eq!(pattern_articulation(&pattern, 8, "arco"), "pizz");
+        assert_eq!(pattern_articulation(&pattern, 16, "arco"), "arco");
     }
 
     #[test]

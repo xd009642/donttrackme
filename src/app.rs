@@ -9,7 +9,8 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     audio::{self, AudioEngine},
     model::{
-        ARRANGEMENT_STEPS, Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Project,
+        ARRANGEMENT_STEPS, AutomationLane, AutomationParameter, AutomationPoint, AutomationValue,
+        Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Pattern, Project,
         STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SampleRegion, SampleSynth,
         SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
     },
@@ -461,8 +462,15 @@ impl DawApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(error) = &self.audio_error {
-                        ui.colored_label(Color32::from_rgb(245, 115, 105), "Audio unavailable")
-                            .on_hover_text(error);
+                        ui.colored_label(
+                            Color32::from_rgb(245, 115, 105),
+                            if self.audio.is_some() {
+                                "Audio/sample error"
+                            } else {
+                                "Audio unavailable"
+                            },
+                        )
+                        .on_hover_text(error);
                     } else if let Some(status) = &self.project_status {
                         ui.label(status);
                     } else {
@@ -1242,6 +1250,7 @@ impl DawApp {
             && !matches!(track.kind, TrackKind::Sample)
         {
             ui.label(format!("Editing {pattern_name}"));
+            pattern_automation_editor(ui, pattern, &track.kind);
             let output = self
                 .piano_roll
                 .show(ui, pattern_id, pattern, &self.auditioned_notes);
@@ -1923,6 +1932,233 @@ impl DawApp {
     }
 }
 
+fn pattern_automation_editor(ui: &mut egui::Ui, pattern: &mut Pattern, kind: &TrackKind) {
+    let (articulations, articulation_default, cutoff_parameter, cutoff_default) = match kind {
+        TrackKind::Sampler { sampler } => {
+            let mut choices = sampler
+                .regions
+                .iter()
+                .map(|region| region.articulation.clone())
+                .collect::<Vec<_>>();
+            choices.sort();
+            choices.dedup();
+            if choices.is_empty() {
+                choices.push(sampler.articulation.clone());
+            }
+            (
+                Some(choices),
+                Some(sampler.articulation.as_str()),
+                AutomationParameter::SamplerFilterCutoff,
+                sampler.filter_cutoff_hz,
+            )
+        }
+        TrackKind::Instrument { synth } => (
+            None,
+            None,
+            AutomationParameter::SynthFilterCutoff,
+            synth.filter_cutoff_hz,
+        ),
+        TrackKind::Sample => return,
+    };
+
+    ui.collapsing("Automation", |ui| {
+        ui.weak("Left-click a lane to add or change a point; right-click a point to remove it.");
+        if let (Some(articulations), Some(default)) = (articulations, articulation_default) {
+            ui.label("Articulation");
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().min(880.0), 34.0),
+                egui::Sense::click(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
+            let lane = pattern
+                .automation
+                .iter()
+                .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation);
+            for step in 0..PATTERN_STEPS {
+                let value = lane
+                    .and_then(|lane| lane.value_at(step))
+                    .and_then(|value| match value {
+                        AutomationValue::Choice(value) => Some(value.as_str()),
+                        AutomationValue::Continuous(_) => None,
+                    })
+                    .unwrap_or(default);
+                let index = articulations
+                    .iter()
+                    .position(|choice| choice == value)
+                    .unwrap_or(0);
+                let x0 = rect.left() + f32::from(step) / f32::from(PATTERN_STEPS) * rect.width();
+                let x1 =
+                    rect.left() + f32::from(step + 1) / f32::from(PATTERN_STEPS) * rect.width();
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.top()),
+                        egui::pos2(x1, rect.bottom()),
+                    ),
+                    0.0,
+                    Color32::from_rgb(
+                        65 + (index as u8 * 31) % 80,
+                        105 + (index as u8 * 47) % 80,
+                        135 + (index as u8 * 19) % 70,
+                    ),
+                );
+            }
+            if let Some(lane) = lane {
+                for point in &lane.points {
+                    let x = rect.left()
+                        + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(2.0, Color32::WHITE),
+                    );
+                    if let AutomationValue::Choice(value) = &point.value {
+                        painter.text(
+                            egui::pos2(x + 4.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            value,
+                            egui::FontId::proportional(11.0),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            }
+            if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
+                    .floor()
+                    .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
+                let current = lane
+                    .and_then(|lane| lane.value_at(step))
+                    .and_then(|value| match value {
+                        AutomationValue::Choice(value) => Some(value.as_str()),
+                        AutomationValue::Continuous(_) => None,
+                    })
+                    .unwrap_or(default);
+                let next = articulations
+                    .iter()
+                    .position(|choice| choice == current)
+                    .map_or(0, |index| (index + 1) % articulations.len());
+                upsert_automation_point(
+                    pattern,
+                    AutomationParameter::SamplerArticulation,
+                    AutomationPoint {
+                        step,
+                        value: AutomationValue::Choice(articulations[next].clone()),
+                    },
+                );
+            }
+            if response.clicked_by(egui::PointerButton::Secondary)
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
+                    .round() as u16;
+                if let Some(lane) = pattern
+                    .automation
+                    .iter_mut()
+                    .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation)
+                {
+                    lane.points.retain(|point| point.step.abs_diff(step) > 1);
+                }
+            }
+        }
+
+        ui.label("Filter cutoff");
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().min(880.0), 70.0),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
+        let lane = pattern
+            .automation
+            .iter()
+            .find(|lane| lane.parameter == cutoff_parameter);
+        let mut previous = None;
+        if let Some(lane) = lane {
+            for point in &lane.points {
+                let AutomationValue::Continuous(value) = point.value else {
+                    continue;
+                };
+                let x =
+                    rect.left() + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
+                let normalized = (value.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
+                let position = egui::pos2(x, rect.bottom() - normalized * rect.height());
+                if let Some(previous) = previous {
+                    painter.line_segment(
+                        [previous, position],
+                        egui::Stroke::new(2.0, Color32::from_rgb(98, 200, 155)),
+                    );
+                }
+                painter.circle_filled(position, 4.0, Color32::from_rgb(98, 200, 155));
+                previous = Some(position);
+            }
+        } else {
+            let normalized = (cutoff_default.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
+            let y = rect.bottom() - normalized * rect.height();
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, Color32::from_gray(80)),
+            );
+        }
+        if (response.clicked() || response.dragged())
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
+                .round()
+                .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
+            let normalized = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+            upsert_automation_point(
+                pattern,
+                cutoff_parameter,
+                AutomationPoint {
+                    step,
+                    value: AutomationValue::Continuous(20.0 * 1_000.0_f32.powf(normalized)),
+                },
+            );
+        }
+        if response.clicked_by(egui::PointerButton::Secondary)
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
+                .round() as u16;
+            if let Some(lane) = pattern
+                .automation
+                .iter_mut()
+                .find(|lane| lane.parameter == cutoff_parameter)
+            {
+                lane.points.retain(|point| point.step.abs_diff(step) > 1);
+            }
+        }
+    });
+}
+
+fn upsert_automation_point(
+    pattern: &mut Pattern,
+    parameter: AutomationParameter,
+    point: AutomationPoint,
+) {
+    let lane = if let Some(index) = pattern
+        .automation
+        .iter()
+        .position(|lane| lane.parameter == parameter)
+    {
+        &mut pattern.automation[index]
+    } else {
+        pattern.automation.push(AutomationLane {
+            parameter,
+            points: Vec::new(),
+        });
+        pattern
+            .automation
+            .last_mut()
+            .expect("an automation lane was just inserted")
+    };
+    lane.points.retain(|existing| existing.step != point.step);
+    lane.points.push(point);
+    lane.points.sort_by_key(|point| point.step);
+}
+
 fn sample_region_editor(
     ui: &mut egui::Ui,
     sampler: &mut SampleSynth,
@@ -2138,6 +2374,7 @@ fn sample_waveform_editor(
 fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, String> {
     let mut pending = vec![folder.to_owned()];
     let mut regions = Vec::new();
+    let mut contains_chromatic_scales = false;
     while let Some(directory) = pending.pop() {
         let entries = std::fs::read_dir(&directory)
             .map_err(|error| format!("Could not read {}: {error}", directory.display()))?;
@@ -2160,6 +2397,15 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
                 continue;
             };
             let parts = stem.split('.').collect::<Vec<_>>();
+            contains_chromatic_scales |= parts.iter().any(|part| {
+                part.char_indices()
+                    .skip(1)
+                    .find(|(_, character)| matches!(character, 'A'..='G'))
+                    .is_some_and(|(index, _)| {
+                        parse_note_pitch(&part[..index]).is_some()
+                            && parse_note_pitch(&part[index..]).is_some()
+                    })
+            });
             let Some(root_pitch) = parts.iter().rev().find_map(|part| parse_note_pitch(part))
             else {
                 continue;
@@ -2198,6 +2444,12 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
             right.velocity_min,
         ))
     });
+    if contains_chromatic_scales {
+        return Err(format!(
+            "{} contains chromatic-scale WAV files that must be split into individual notes before import",
+            folder.display()
+        ));
+    }
     for index in 0..regions.len() {
         let roots = regions
             .iter()
@@ -2230,6 +2482,7 @@ fn downloaded_iowa_instruments() -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
+        .filter(|path| discover_iowa_regions(path).is_ok_and(|regions| !regions.is_empty()))
         .collect::<Vec<_>>();
     instruments.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     instruments
@@ -2541,5 +2794,20 @@ mod tests {
             (regions[2].velocity_min, regions[2].velocity_max),
             (85, 127)
         );
+    }
+
+    #[test]
+    fn iowa_import_rejects_unsplit_chromatic_scale_recordings() {
+        let folder =
+            std::env::temp_dir().join(format!("donttrackme-iowa-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("temporary Iowa folder should be created");
+        std::fs::File::create(folder.join("Cello.arco.ff.C2B2.wav"))
+            .expect("empty chromatic scale fixture should be created");
+
+        let error = discover_iowa_regions(&folder)
+            .expect_err("an unsplit chromatic scale must not become one sample region");
+        std::fs::remove_dir_all(folder).expect("temporary Iowa folder should be removed");
+
+        assert!(error.contains("must be split into individual notes"));
     }
 }
