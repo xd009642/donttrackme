@@ -1567,6 +1567,7 @@ impl DawApp {
                                     Ok(regions) if !regions.is_empty() => {
                                         sampler.path = Some(regions[0].path.clone());
                                         sampler.root_pitch = regions[0].root_pitch;
+                                        sampler.articulation = regions[0].articulation.clone();
                                         sampler.regions = regions;
                                         sampler.trim_start = 0.0;
                                         sampler.trim_end = 1.0;
@@ -1600,6 +1601,7 @@ impl DawApp {
                             sampler.trim_start = 0.0;
                             sampler.trim_end = 1.0;
                             sampler.regions.clear();
+                            sampler.articulation = "Standard".to_owned();
                         }
                         if ui.button("Import Iowa instrument").clicked()
                             && let Some(folder) = rfd::FileDialog::new()
@@ -1611,6 +1613,7 @@ impl DawApp {
                                 Ok(regions) if !regions.is_empty() => {
                                     sampler.path = Some(regions[0].path.clone());
                                     sampler.root_pitch = regions[0].root_pitch;
+                                    sampler.articulation = regions[0].articulation.clone();
                                     sampler.regions = regions;
                                     sampler.trim_start = 0.0;
                                     sampler.trim_end = 1.0;
@@ -1635,8 +1638,37 @@ impl DawApp {
                     });
                     if !sampler.regions.is_empty() {
                         ui.label(format!("{} mapped sample regions", sampler.regions.len()));
-                        // TODO: Split Iowa folders into selectable articulation presets instead of
-                        // combining arco, pizzicato, vibrato, and other techniques in one map.
+                        let mut articulations = sampler
+                            .regions
+                            .iter()
+                            .map(|region| region.articulation.clone())
+                            .collect::<Vec<_>>();
+                        articulations.sort();
+                        articulations.dedup();
+                        ui.horizontal(|ui| {
+                            ui.label("Articulation");
+                            let previous = sampler.articulation.clone();
+                            egui::ComboBox::from_id_salt("sampler-articulation")
+                                .selected_text(&sampler.articulation)
+                                .show_ui(ui, |ui| {
+                                    for articulation in articulations {
+                                        ui.selectable_value(
+                                            &mut sampler.articulation,
+                                            articulation.clone(),
+                                            articulation,
+                                        );
+                                    }
+                                });
+                            if sampler.articulation != previous {
+                                let region = sampler
+                                    .regions
+                                    .iter()
+                                    .find(|region| region.articulation == sampler.articulation)
+                                    .expect("the selected articulation came from a sample region");
+                                sampler.path = Some(region.path.clone());
+                                sampler.root_pitch = region.root_pitch;
+                            }
+                        });
                     }
                     ui.add_space(8.0);
                     sample_waveform_editor(ui, &self.sampler_waveform, sampler, &mut trim_drag);
@@ -1891,15 +1923,29 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
             } else {
                 (1, 127)
             };
+            let articulation = parts
+                .iter()
+                .position(|part| matches!(*part, "pp" | "mf" | "ff"))
+                .filter(|index| *index > 1)
+                .map(|index| parts[1..index].join(" "))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "Standard".to_owned());
             regions.push(SampleRegion {
                 path,
                 root_pitch,
                 velocity_min,
                 velocity_max,
+                articulation,
             });
         }
     }
-    regions.sort_by_key(|region| (region.root_pitch, region.velocity_min));
+    regions.sort_by(|left, right| {
+        (&left.articulation, left.root_pitch, left.velocity_min).cmp(&(
+            &right.articulation,
+            right.root_pitch,
+            right.velocity_min,
+        ))
+    });
     Ok(regions)
 }
 
@@ -2137,7 +2183,7 @@ impl eframe::App for DawApp {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{PIANO_KEYS, TapTempo, parse_note_pitch};
+    use super::{PIANO_KEYS, TapTempo, discover_iowa_regions, parse_note_pitch};
     use eframe::egui::Key;
 
     #[test]
@@ -2179,5 +2225,26 @@ mod tests {
         assert_eq!(parse_note_pitch("Bb3"), Some(58));
         assert_eq!(parse_note_pitch("F#5"), Some(78));
         assert_eq!(parse_note_pitch("stereo"), None);
+    }
+
+    #[test]
+    fn iowa_import_separates_articulations_and_dynamics() {
+        let folder =
+            std::env::temp_dir().join(format!("donttrackme-iowa-regions-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("temporary Iowa folder should be created");
+        for name in ["Violin.arco.pp.C4.wav", "Violin.pizz.ff.D4.wav"] {
+            std::fs::File::create(folder.join(name)).expect("empty fixture WAV should be created");
+        }
+
+        let regions = discover_iowa_regions(&folder).expect("Iowa filenames should be discovered");
+        std::fs::remove_dir_all(folder).expect("temporary Iowa folder should be removed");
+
+        assert_eq!(regions[0].articulation, "arco");
+        assert_eq!((regions[0].velocity_min, regions[0].velocity_max), (1, 42));
+        assert_eq!(regions[1].articulation, "pizz");
+        assert_eq!(
+            (regions[1].velocity_min, regions[1].velocity_max),
+            (85, 127)
+        );
     }
 }

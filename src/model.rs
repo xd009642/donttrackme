@@ -160,6 +160,7 @@ pub struct SampleSynth {
     pub path: Option<PathBuf>,
     pub root_pitch: u8,
     pub regions: Vec<SampleRegion>,
+    pub articulation: String,
     pub trim_start: f32,
     pub trim_end: f32,
     pub speed: f32,
@@ -181,6 +182,7 @@ pub struct SampleRegion {
     pub root_pitch: u8,
     pub velocity_min: u8,
     pub velocity_max: u8,
+    pub articulation: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +206,7 @@ impl Default for SampleSynth {
             path: None,
             root_pitch: 60,
             regions: Vec::new(),
+            articulation: "Standard".to_owned(),
             trim_start: 0.0,
             trim_end: 1.0,
             speed: 1.0,
