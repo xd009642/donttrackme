@@ -17,7 +17,10 @@ use crate::model::{
     ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, DEFAULT_EFFECTS, EffectKind,
     EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT, TrackKind,
 };
-use crate::synths::{SampleLoopMode, SampleSynth, SimpleWaveformSynth, noise_sample};
+use crate::synths::{
+    FmAlgorithm, FmOperator, FmSynth, SampleLoopMode, SampleSynth, SimpleWaveformSynth,
+    noise_sample,
+};
 
 enum Command {
     Play(PlaybackPlan),
@@ -27,6 +30,10 @@ enum Command {
     AuditionStart {
         pitch: u8,
         synth: SimpleWaveformSynth,
+    },
+    AuditionFmStart {
+        pitch: u8,
+        synth: FmSynth,
     },
     AuditionStop {
         pitch: u8,
@@ -52,6 +59,7 @@ struct ChannelPlan {
 
 enum RenderInstrument {
     Synth(SimpleWaveformSynth),
+    Fm(FmSynth),
     Sampler { sampler: SampleSynth },
 }
 
@@ -72,6 +80,7 @@ struct Voice {
     // slice samples filter cutoff at note-on, which proves shared synth/sampler targeting but
     // does not yet sweep a note that is already sounding.
     automated_filter_cutoff: Option<f32>,
+    fm_feedback: f32,
 }
 
 #[derive(Default)]
@@ -198,6 +207,12 @@ impl AudioEngine {
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
+    pub fn audition_fm_start(&self, pitch: u8, synth: FmSynth) -> Result<(), String> {
+        self.commands
+            .send(Command::AuditionFmStart { pitch, synth })
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
     pub fn audition_stop(&self, pitch: u8) -> Result<(), String> {
         self.commands
             .send(Command::AuditionStop { pitch })
@@ -314,6 +329,7 @@ impl PlaybackPlan {
             }
             let instrument = match &channel.kind {
                 TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
+                TrackKind::Fm { synth } => RenderInstrument::Fm(*synth),
                 TrackKind::Sampler { sampler } => {
                     if sampler.path.is_none() && sampler.regions.is_empty() {
                         continue;
@@ -355,6 +371,7 @@ impl PlaybackPlan {
                         filter: FilterState::default(),
                         sample: Some(sample),
                         automated_filter_cutoff: None,
+                        fm_feedback: 0.0,
                     });
                 }
             } else {
@@ -383,6 +400,7 @@ impl PlaybackPlan {
                                 RenderInstrument::Synth(synth) => {
                                     pitch_frequency(note.pitch, synth.pitch_shift)
                                 }
+                                RenderInstrument::Fm(_) => pitch_frequency(note.pitch, 0),
                                 RenderInstrument::Sampler { sampler } => {
                                     let (_, root_pitch) = select_sample_region(
                                         sampler,
@@ -423,6 +441,7 @@ impl PlaybackPlan {
                                     }
                                 }
                                 RenderInstrument::Synth(_) => None,
+                                RenderInstrument::Fm(_) => None,
                             };
                             channel_voices.push(Voice {
                                 start_sample: (f32::from(start_step) * samples_per_step).round()
@@ -439,6 +458,7 @@ impl PlaybackPlan {
                                     note.start_step,
                                     &instrument,
                                 ),
+                                fm_feedback: 0.0,
                             });
                         }
                     }
@@ -467,6 +487,7 @@ impl PlaybackPlan {
                         RenderInstrument::Sampler { .. } => {
                             EffectChain::new(DEFAULT_EFFECTS, sample_rate)
                         }
+                        RenderInstrument::Fm(_) => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
                     },
                     instrument,
                     voices: channel_voices,
@@ -494,6 +515,7 @@ impl PlaybackPlan {
             .ok_or_else(|| "The pattern's instrument channel is missing".to_owned())?;
         let instrument = match &channel.kind {
             TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
+            TrackKind::Fm { synth } => RenderInstrument::Fm(*synth),
             TrackKind::Sampler { sampler } => {
                 if sampler.path.is_none() && sampler.regions.is_empty() {
                     return Err("Load a WAV into the sampler first".to_owned());
@@ -514,6 +536,7 @@ impl PlaybackPlan {
                     RenderInstrument::Synth(synth) => {
                         pitch_frequency(note.pitch, synth.pitch_shift)
                     }
+                    RenderInstrument::Fm(_) => pitch_frequency(note.pitch, 0),
                     RenderInstrument::Sampler { sampler } => {
                         let (_, root_pitch) = select_sample_region(
                             sampler,
@@ -544,6 +567,7 @@ impl PlaybackPlan {
                         }
                     }
                     RenderInstrument::Synth(_) => None,
+                    RenderInstrument::Fm(_) => None,
                 };
                 Ok(Voice {
                     start_sample: (f32::from(note.start_step) * samples_per_step).round() as u64,
@@ -560,6 +584,7 @@ impl PlaybackPlan {
                         note.start_step,
                         &instrument,
                     ),
+                    fm_feedback: 0.0,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -575,6 +600,7 @@ impl PlaybackPlan {
         let effects = match &instrument {
             RenderInstrument::Synth(synth) => EffectChain::new(synth.effects, sample_rate),
             RenderInstrument::Sampler { .. } => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
+            RenderInstrument::Fm(_) => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
         };
         Ok(Self {
             channels: vec![ChannelPlan {
@@ -616,6 +642,7 @@ struct Renderer {
     audition_voices: Vec<AuditionVoice>,
     audition_effects: Option<EffectChain>,
     audition_samples: Vec<AuditionSampleVoice>,
+    audition_fm: Vec<AuditionFmVoice>,
 }
 
 struct AuditionVoice {
@@ -640,6 +667,14 @@ struct AuditionSampleVoice {
     finished: bool,
 }
 
+struct AuditionFmVoice {
+    pitch: u8,
+    synth: FmSynth,
+    elapsed: u64,
+    released_at: Option<u64>,
+    feedback: f32,
+}
+
 impl Renderer {
     fn new(receiver: Receiver<Command>, sample_rate: f32) -> Self {
         Self {
@@ -651,6 +686,7 @@ impl Renderer {
             audition_voices: Vec::with_capacity(40),
             audition_effects: None,
             audition_samples: Vec::with_capacity(40),
+            audition_fm: Vec::with_capacity(40),
         }
     }
 
@@ -691,6 +727,16 @@ impl Renderer {
                     }
                 }
                 Command::AuditionStart { pitch, synth } => self.start_audition(pitch, synth),
+                Command::AuditionFmStart { pitch, synth } => {
+                    self.audition_fm.retain(|voice| voice.pitch != pitch);
+                    self.audition_fm.push(AuditionFmVoice {
+                        pitch,
+                        synth,
+                        elapsed: 0,
+                        released_at: None,
+                        feedback: 0.0,
+                    });
+                }
                 Command::AuditionStop { pitch } => {
                     for voice in self
                         .audition_voices
@@ -699,6 +745,13 @@ impl Renderer {
                     {
                         let level = held_envelope(&voice.synth, voice.elapsed, self.sample_rate);
                         voice.released_at = Some((voice.elapsed, level));
+                    }
+                    for voice in self
+                        .audition_fm
+                        .iter_mut()
+                        .filter(|voice| voice.pitch == pitch && voice.released_at.is_none())
+                    {
+                        voice.released_at = Some(voice.elapsed);
                     }
                     for voice in self
                         .audition_samples
@@ -812,6 +865,33 @@ impl Renderer {
                                 self.sample_rate,
                             );
                             add_panned(&mut channel_output, filtered, synth.pan);
+                        }
+                    }
+                    RenderInstrument::Fm(synth) => {
+                        let release = synth
+                            .operators
+                            .iter()
+                            .map(|operator| ms_samples(operator.release_ms, self.sample_rate))
+                            .max()
+                            .expect("FM synth always has four operators");
+                        for voice in &mut channel.voices {
+                            if self.position < voice.start_sample
+                                || self.position >= voice.note_off_sample + release
+                            {
+                                continue;
+                            }
+                            let elapsed = self.position - voice.start_sample;
+                            let note_length = voice.note_off_sample - voice.start_sample;
+                            let raw = fm_sample(
+                                synth,
+                                elapsed,
+                                note_length,
+                                voice.frequency,
+                                self.sample_rate,
+                                &mut voice.fm_feedback,
+                            ) * voice.gain
+                                * synth.master_level;
+                            add_panned(&mut channel_output, raw, synth.pan);
                         }
                     }
                     RenderInstrument::Sampler { sampler } => {
@@ -957,6 +1037,32 @@ impl Renderer {
                     voice.elapsed
                         < released_at + ms_samples(voice.sampler.release_ms, self.sample_rate)
                 })
+        });
+        for voice in &mut self.audition_fm {
+            let note_length = voice.released_at.unwrap_or(u64::MAX);
+            let frequency = pitch_frequency(voice.pitch, 0);
+            let raw = fm_sample(
+                &voice.synth,
+                voice.elapsed,
+                note_length,
+                frequency,
+                self.sample_rate,
+                &mut voice.feedback,
+            ) * voice.synth.master_level;
+            add_panned(&mut output, raw, voice.synth.pan);
+            voice.elapsed += 1;
+        }
+        self.audition_fm.retain(|voice| {
+            voice.released_at.is_none_or(|released_at| {
+                let release = voice
+                    .synth
+                    .operators
+                    .iter()
+                    .map(|operator| ms_samples(operator.release_ms, self.sample_rate))
+                    .max()
+                    .expect("FM synth always has four operators");
+                voice.elapsed < released_at + release
+            })
         });
 
         [output[0].tanh(), output[1].tanh()]
@@ -1188,6 +1294,83 @@ fn oscillator_sample(
         / f32::from(synth.layer_count)
 }
 
+fn fm_sample(
+    synth: &FmSynth,
+    elapsed: u64,
+    note_length: u64,
+    frequency: f32,
+    sample_rate: f32,
+    feedback_state: &mut f32,
+) -> f32 {
+    let mut phases = [0.0; 4];
+    let mut levels = [0.0; 4];
+    for (index, operator) in synth.operators.iter().enumerate() {
+        let operator_frequency =
+            frequency * operator.ratio * 2.0_f32.powf(operator.detune_cents / 1_200.0);
+        phases[index] =
+            std::f32::consts::TAU * (elapsed as f32 * operator_frequency / sample_rate).fract();
+        levels[index] =
+            operator.level * fm_operator_envelope(operator, elapsed, note_length, sample_rate);
+    }
+    let feedback_operator = (phases[3] + *feedback_state * synth.feedback * 6.0).sin() * levels[3];
+    *feedback_state = feedback_operator;
+    match synth.algorithm {
+        FmAlgorithm::Stack => {
+            let operator_3 = (phases[2] + feedback_operator * 6.0).sin() * levels[2];
+            let operator_2 = (phases[1] + operator_3 * 6.0).sin() * levels[1];
+            (phases[0] + operator_2 * 6.0).sin() * levels[0]
+        }
+        FmAlgorithm::TwoPairs => {
+            let first = (phases[0] + phases[1].sin() * levels[1] * 6.0).sin() * levels[0];
+            let second = (phases[2] + feedback_operator * 6.0).sin() * levels[2];
+            (first + second) * 0.5
+        }
+        FmAlgorithm::ThreeModulators => {
+            let modulation =
+                phases[1].sin() * levels[1] + phases[2].sin() * levels[2] + feedback_operator;
+            (phases[0] + modulation * 4.0).sin() * levels[0]
+        }
+        FmAlgorithm::Additive => {
+            (phases[0].sin() * levels[0]
+                + phases[1].sin() * levels[1]
+                + phases[2].sin() * levels[2]
+                + feedback_operator)
+                * 0.25
+        }
+    }
+}
+
+fn fm_operator_envelope(
+    operator: &FmOperator,
+    elapsed: u64,
+    note_length: u64,
+    sample_rate: f32,
+) -> f32 {
+    let attack = ms_samples(operator.attack_ms, sample_rate);
+    let decay = ms_samples(operator.decay_ms, sample_rate);
+    let held = |time: u64| {
+        if time < attack && attack > 0 {
+            time as f32 / attack as f32
+        } else if time < attack + decay && decay > 0 {
+            let progress = (time - attack) as f32 / decay as f32;
+            1.0 + (operator.sustain - 1.0) * progress
+        } else {
+            operator.sustain
+        }
+    };
+    if elapsed < note_length {
+        held(elapsed)
+    } else {
+        let release = ms_samples(operator.release_ms, sample_rate);
+        if release == 0 {
+            0.0
+        } else {
+            held(note_length)
+                * (1.0 - (elapsed - note_length) as f32 / release as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
 fn pattern_articulation<'a>(pattern: &'a Pattern, step: u16, default: &'a str) -> &'a str {
     pattern
         .automation
@@ -1209,6 +1392,7 @@ fn pattern_filter_cutoff(
     let parameter = match instrument {
         RenderInstrument::Synth(_) => AutomationParameter::SynthFilterCutoff,
         RenderInstrument::Sampler { .. } => AutomationParameter::SamplerFilterCutoff,
+        RenderInstrument::Fm(_) => return None,
     };
     pattern
         .automation
@@ -1389,14 +1573,16 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 mod tests {
     use super::{
         EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
-        glide_frequency, held_envelope, held_sample_envelope, note_envelope, pattern_articulation,
-        pitch_frequency, sampler_frame, select_sample_region,
+        fm_sample, glide_frequency, held_envelope, held_sample_envelope, note_envelope,
+        pattern_articulation, pitch_frequency, sampler_frame, select_sample_region,
     };
     use crate::model::{
         AutomationLane, AutomationParameter, AutomationPoint, AutomationValue, DEFAULT_EFFECTS,
         EffectKind, Pattern, Project, TrackKind,
     };
-    use crate::synths::{SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth};
+    use crate::synths::{
+        FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth,
+    };
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1439,6 +1625,20 @@ mod tests {
             .expect("a matching multisample region should exist");
         assert_eq!(path, std::path::Path::new("loud-g4.wav"));
         assert_eq!(root, 67);
+    }
+
+    #[test]
+    fn fm_algorithms_produce_distinct_finite_samples() {
+        let mut synth = FmSynth::default();
+        let mut feedback = 0.0;
+        let stack = fm_sample(&synth, 137, 1_000, 220.0, 44_100.0, &mut feedback);
+        synth.algorithm = FmAlgorithm::Additive;
+        feedback = 0.0;
+        let additive = fm_sample(&synth, 137, 1_000, 220.0, 44_100.0, &mut feedback);
+
+        assert!(stack.is_finite());
+        assert!(additive.is_finite());
+        assert!((stack - additive).abs() > f32::EPSILON);
     }
 
     #[test]

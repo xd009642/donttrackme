@@ -15,7 +15,8 @@ use crate::{
     },
     piano_roll, project_io,
     synths::{
-        SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth, Waveform, noise_sample,
+        FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth,
+        Waveform, noise_sample,
     },
 };
 
@@ -232,17 +233,20 @@ impl DawApp {
                 .iter()
                 .find(|track| track.id == selected)
                 .and_then(|track| match &track.kind {
-                    TrackKind::Instrument { synth } => Some((Some(*synth), None)),
-                    TrackKind::Sampler { sampler } => Some((None, Some(sampler.clone()))),
+                    TrackKind::Fm { synth } => Some((None, Some(*synth), None)),
+                    TrackKind::Instrument { synth } => Some((Some(*synth), None, None)),
+                    TrackKind::Sampler { sampler } => Some((None, None, Some(sampler.clone()))),
                     TrackKind::Sample => None,
                 })
         });
 
         if let Some(audio) = &self.audio {
-            if let Some((synth, sampler)) = instrument {
+            if let Some((synth, fm, sampler)) = instrument {
                 for pitch in desired.difference(&self.auditioned_notes) {
                     let result = if let Some(synth) = synth {
                         audio.audition_start(*pitch, synth)
+                    } else if let Some(synth) = fm {
+                        audio.audition_fm_start(*pitch, synth)
                     } else {
                         audio.audition_sample_start(
                             *pitch,
@@ -457,7 +461,9 @@ impl DawApp {
                 let piano_enabled = self.selected_track_mut().is_some_and(|track| {
                     matches!(
                         track.kind,
-                        TrackKind::Instrument { .. } | TrackKind::Sampler { .. }
+                        TrackKind::Instrument { .. }
+                            | TrackKind::Fm { .. }
+                            | TrackKind::Sampler { .. }
                     )
                 });
                 ui.add_enabled_ui(piano_enabled, |ui| {
@@ -550,6 +556,10 @@ impl DawApp {
                             self.selected_track = Some(self.project.add_instrument());
                             ui.close();
                         }
+                        if ui.button("FM synth").clicked() {
+                            self.selected_track = Some(self.project.add_fm());
+                            ui.close();
+                        }
                         if ui.button("Sampler").clicked() {
                             self.selected_track = Some(self.project.add_sampler());
                             ui.close();
@@ -585,6 +595,7 @@ impl DawApp {
                     let selected = self.selected_track == Some(track.id);
                     let icon = match track.kind {
                         TrackKind::Instrument { .. } => "⌁",
+                        TrackKind::Fm { .. } => "≋",
                         TrackKind::Sampler { .. } => "◫",
                         TrackKind::Sample => "▰",
                     };
@@ -612,6 +623,7 @@ impl DawApp {
                                         if matches!(
                                             track.kind,
                                             TrackKind::Instrument { .. }
+                                                | TrackKind::Fm { .. }
                                                 | TrackKind::Sampler { .. }
                                         ) && ui
                                             .small_button("⚙")
@@ -642,7 +654,9 @@ impl DawApp {
                             track.id == channel_id
                                 && matches!(
                                     track.kind,
-                                    TrackKind::Instrument { .. } | TrackKind::Sampler { .. }
+                                    TrackKind::Instrument { .. }
+                                        | TrackKind::Fm { .. }
+                                        | TrackKind::Sampler { .. }
                                 )
                         })
                     {
@@ -807,6 +821,10 @@ impl DawApp {
                     self.selected_track = Some(self.project.add_instrument());
                     ui.close();
                 }
+                if ui.button("FM synth").clicked() {
+                    self.selected_track = Some(self.project.add_fm());
+                    ui.close();
+                }
                 if ui.button("Sampler").clicked() {
                     self.selected_track = Some(self.project.add_sampler());
                     ui.close();
@@ -856,7 +874,9 @@ impl DawApp {
                         ui.label(&track.name);
                         if matches!(
                             track.kind,
-                            TrackKind::Instrument { .. } | TrackKind::Sampler { .. }
+                            TrackKind::Instrument { .. }
+                                | TrackKind::Fm { .. }
+                                | TrackKind::Sampler { .. }
                         ) && ui.small_button("+ Pattern clip").clicked()
                         {
                             let start = track
@@ -1033,6 +1053,7 @@ impl DawApp {
                             .expect("every clip instance references a library source");
                         let color = match track.kind {
                             TrackKind::Instrument { .. } => Color32::from_rgb(68, 142, 112),
+                            TrackKind::Fm { .. } => Color32::from_rgb(76, 128, 174),
                             TrackKind::Sampler { .. } => Color32::from_rgb(137, 91, 166),
                             TrackKind::Sample => Color32::from_rgb(70, 101, 157),
                         };
@@ -1242,6 +1263,9 @@ impl DawApp {
                 TrackKind::Sampler { .. } => {
                     ui.label("Sampler");
                 }
+                TrackKind::Fm { .. } => {
+                    ui.label("FM synth");
+                }
                 TrackKind::Sample => {}
             }
             if !matches!(track.kind, TrackKind::Sample) && ui.button("Settings").clicked() {
@@ -1272,6 +1296,7 @@ impl DawApp {
                 if let Some(pitch) = output.note_on {
                     let result = match &track.kind {
                         TrackKind::Instrument { synth } => audio.audition_start(pitch, *synth),
+                        TrackKind::Fm { synth } => audio.audition_fm_start(pitch, *synth),
                         TrackKind::Sampler { sampler } => {
                             audio.audition_sample_start(pitch, sampler.clone())
                         }
@@ -1300,6 +1325,16 @@ impl DawApp {
             .is_some_and(|track| matches!(track.kind, TrackKind::Sampler { .. }))
         {
             self.sampler_settings(ui, selected);
+            return;
+        }
+        if self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == selected)
+            .is_some_and(|track| matches!(track.kind, TrackKind::Fm { .. }))
+        {
+            self.fm_settings(ui, selected);
             return;
         }
         let Some(track) = self
@@ -1629,6 +1664,154 @@ impl DawApp {
             }
             if let Some(pitch) = keyboard_output.note_on
                 && let Err(error) = audio.audition_start(pitch, audition_synth)
+            {
+                self.audio_error = Some(error);
+            }
+        }
+    }
+
+    fn fm_settings(&mut self, ui: &mut egui::Ui, selected: u64) {
+        let Some(track) = self
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == selected)
+        else {
+            return;
+        };
+        let TrackKind::Fm { synth } = &mut track.kind else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.heading("Four-operator FM synth");
+            ui.separator();
+            ui.label(&track.name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open piano roll").clicked() {
+                    self.view = View::PianoRoll;
+                }
+            });
+        });
+        ui.add_space(12.0);
+        let mut keyboard_output = SynthKeyboardOutput::default();
+        let mut mouse_pitch = self.synth_mouse_pitch;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(920.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Presets");
+                    egui::ComboBox::from_id_salt("fm-preset")
+                        .selected_text("Choose preset…")
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            let mut categories = Vec::new();
+                            for preset in FmSynth::PRESETS {
+                                if !categories.contains(&preset.category) {
+                                    categories.push(preset.category);
+                                }
+                            }
+                            for (index, category) in categories.into_iter().enumerate() {
+                                if index > 0 {
+                                    ui.separator();
+                                }
+                                ui.label(egui::RichText::new(category).strong());
+                                for preset in FmSynth::PRESETS
+                                    .iter()
+                                    .filter(|preset| preset.category == category)
+                                {
+                                    if ui.selectable_label(false, preset.name).clicked() {
+                                        *synth = preset.synth;
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Routing and output");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("fm-algorithm")
+                            .selected_text(synth.algorithm.name())
+                            .show_ui(ui, |ui| {
+                                for algorithm in FmAlgorithm::ALL {
+                                    ui.selectable_value(
+                                        &mut synth.algorithm,
+                                        algorithm,
+                                        algorithm.name(),
+                                    );
+                                }
+                            });
+                        ui.add(egui::Slider::new(&mut synth.feedback, 0.0..=1.0).text("Feedback"));
+                        ui.add(
+                            egui::Slider::new(&mut synth.master_level, 0.0..=1.0)
+                                .text("Master level"),
+                        );
+                        ui.add(egui::Slider::new(&mut synth.pan, -1.0..=1.0).text("Pan"));
+                    });
+                    ui.monospace(synth.algorithm.name());
+                });
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                for (index, operator) in synth.operators.iter_mut().enumerate() {
+                    egui::Frame::group(columns[index % 2].style())
+                        .inner_margin(12.0)
+                        .show(&mut columns[index % 2], |ui| {
+                            ui.heading(format!("Operator {}", index + 1));
+                            ui.add(
+                                egui::Slider::new(&mut operator.ratio, 0.25..=16.0)
+                                    .logarithmic(true)
+                                    .text("Ratio"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut operator.detune_cents, -100.0..=100.0)
+                                    .text("Detune")
+                                    .suffix(" cents"),
+                            );
+                            ui.add(egui::Slider::new(&mut operator.level, 0.0..=1.0).text("Level"));
+                            ui.add(
+                                egui::Slider::new(&mut operator.attack_ms, 0.0..=2_000.0)
+                                    .text("Attack")
+                                    .suffix(" ms"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut operator.decay_ms, 0.0..=3_000.0)
+                                    .text("Decay")
+                                    .suffix(" ms"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut operator.sustain, 0.0..=1.0).text("Sustain"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut operator.release_ms, 0.0..=5_000.0)
+                                    .text("Release")
+                                    .suffix(" ms"),
+                            );
+                        });
+                }
+            });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Test keyboard");
+                    keyboard_output =
+                        synth_test_keyboard(ui, &self.auditioned_notes, &mut mouse_pitch);
+                });
+        });
+        self.synth_mouse_pitch = mouse_pitch;
+        let audition_synth = *synth;
+        if let Some(audio) = &self.audio {
+            if let Some(pitch) = keyboard_output.note_off
+                && let Err(error) = audio.audition_stop(pitch)
+            {
+                self.audio_error = Some(error);
+            }
+            if let Some(pitch) = keyboard_output.note_on
+                && let Err(error) = audio.audition_fm_start(pitch, audition_synth)
             {
                 self.audio_error = Some(error);
             }
@@ -1987,6 +2170,7 @@ fn pattern_automation_editor(
             AutomationParameter::SynthFilterCutoff,
             synth.filter_cutoff_hz,
         ),
+        TrackKind::Fm { .. } => return,
         TrackKind::Sample => return,
     };
 

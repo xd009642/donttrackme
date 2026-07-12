@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::synths::{SampleSynth, SimpleWaveformSynth};
+use crate::synths::{FmSynth, SampleSynth, SimpleWaveformSynth};
 
 pub const STEPS_PER_BEAT: u16 = 8;
 pub const STEPS_PER_BAR: u16 = STEPS_PER_BEAT * 4;
@@ -119,6 +119,7 @@ impl FilterKind {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackKind {
     Instrument { synth: SimpleWaveformSynth },
+    Fm { synth: FmSynth },
     Sampler { sampler: SampleSynth },
     Sample,
 }
@@ -317,6 +318,22 @@ impl Track {
         }
     }
 
+    pub fn fm(id: u64, source_id: u64, name: String) -> Self {
+        Self {
+            id,
+            name,
+            kind: TrackKind::Fm {
+                synth: FmSynth::default(),
+            },
+            source_id,
+            clips: Vec::new(),
+            muted: false,
+            solo: false,
+            rendered_from: None,
+            next_clip_id: 1,
+        }
+    }
+
     pub fn add_clip(&mut self, source_id: u64, start_step: u16, length_steps: u16) -> u64 {
         let id = self.next_clip_id;
         self.next_clip_id += 1;
@@ -413,6 +430,31 @@ impl Project {
             .count()
             + 1;
         self.add_configured_sampler(format!("Sampler {number}"), SampleSynth::default())
+    }
+
+    pub fn add_fm(&mut self) -> u64 {
+        let id = self.next_track_id;
+        self.next_track_id += 1;
+        let source_id = self.next_source_id;
+        self.next_source_id += 1;
+        let number = self
+            .tracks
+            .iter()
+            .filter(|track| matches!(track.kind, TrackKind::Fm { .. }))
+            .count()
+            + 1;
+        self.clip_library.push(ClipSource {
+            id: source_id,
+            channel_id: id,
+            name: format!("FM pattern {number}"),
+            length_steps: PATTERN_STEPS,
+            kind: ClipSourceKind::Pattern {
+                pattern: Pattern::default(),
+            },
+        });
+        self.tracks
+            .push(Track::fm(id, source_id, format!("FM synth {number}")));
+        id
     }
 
     pub fn add_configured_sampler(&mut self, name: String, sampler: SampleSynth) -> u64 {
