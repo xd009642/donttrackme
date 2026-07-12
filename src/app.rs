@@ -145,6 +145,7 @@ pub struct DawApp {
     sampler_browser_directory: PathBuf,
     selected_iowa_instrument: Option<PathBuf>,
     selected_sample_region: Option<usize>,
+    automation_articulation_brush: String,
 }
 
 impl DawApp {
@@ -180,6 +181,7 @@ impl DawApp {
                 .expect("the DAW must start from an accessible working directory"),
             selected_iowa_instrument: None,
             selected_sample_region: None,
+            automation_articulation_brush: String::new(),
         }
     }
 
@@ -1250,7 +1252,12 @@ impl DawApp {
             && !matches!(track.kind, TrackKind::Sample)
         {
             ui.label(format!("Editing {pattern_name}"));
-            pattern_automation_editor(ui, pattern, &track.kind);
+            pattern_automation_editor(
+                ui,
+                pattern,
+                &track.kind,
+                &mut self.automation_articulation_brush,
+            );
             let output = self
                 .piano_roll
                 .show(ui, pattern_id, pattern, &self.auditioned_notes);
@@ -1932,7 +1939,12 @@ impl DawApp {
     }
 }
 
-fn pattern_automation_editor(ui: &mut egui::Ui, pattern: &mut Pattern, kind: &TrackKind) {
+fn pattern_automation_editor(
+    ui: &mut egui::Ui,
+    pattern: &mut Pattern,
+    kind: &TrackKind,
+    articulation_brush: &mut String,
+) {
     let (articulations, articulation_default, cutoff_parameter, cutoff_default) = match kind {
         TrackKind::Sampler { sampler } => {
             let mut choices = sampler
@@ -1961,90 +1973,243 @@ fn pattern_automation_editor(ui: &mut egui::Ui, pattern: &mut Pattern, kind: &Tr
         TrackKind::Sample => return,
     };
 
-    ui.collapsing("Automation", |ui| {
-        ui.weak("Left-click a lane to add or change a point; right-click a point to remove it.");
-        if let (Some(articulations), Some(default)) = (articulations, articulation_default) {
-            ui.label("Articulation");
-            let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width().min(880.0), 34.0),
-                egui::Sense::click(),
-            );
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
-            let lane = pattern
-                .automation
-                .iter()
-                .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation);
-            for step in 0..PATTERN_STEPS {
-                let value = lane
-                    .and_then(|lane| lane.value_at(step))
-                    .and_then(|value| match value {
-                        AutomationValue::Choice(value) => Some(value.as_str()),
-                        AutomationValue::Continuous(_) => None,
-                    })
-                    .unwrap_or(default);
-                let index = articulations
-                    .iter()
-                    .position(|choice| choice == value)
-                    .unwrap_or(0);
-                let x0 = rect.left() + f32::from(step) / f32::from(PATTERN_STEPS) * rect.width();
-                let x1 =
-                    rect.left() + f32::from(step + 1) / f32::from(PATTERN_STEPS) * rect.width();
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x0, rect.top()),
-                        egui::pos2(x1, rect.bottom()),
-                    ),
-                    0.0,
-                    Color32::from_rgb(
-                        65 + (index as u8 * 31) % 80,
-                        105 + (index as u8 * 47) % 80,
-                        135 + (index as u8 * 19) % 70,
-                    ),
+    egui::Frame::group(ui.style())
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.heading("Automation lanes");
+            if let (Some(articulations), Some(default)) = (articulations, articulation_default) {
+                if articulation_brush.is_empty() || !articulations.contains(articulation_brush) {
+                    *articulation_brush = default.to_owned();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Articulation brush");
+                    egui::ComboBox::from_id_salt("automation-articulation-brush")
+                        .selected_text(articulation_brush.as_str())
+                        .show_ui(ui, |ui| {
+                            for articulation in &articulations {
+                                ui.selectable_value(
+                                    articulation_brush,
+                                    articulation.clone(),
+                                    articulation,
+                                );
+                            }
+                        });
+                    if ui.button("Clear lane").clicked() {
+                        pattern.automation.retain(|lane| {
+                            lane.parameter != AutomationParameter::SamplerArticulation
+                        });
+                    }
+                });
+                ui.weak(
+                    "Click the timeline to paint from that step onward. Right-click a marker to remove it.",
                 );
-            }
-            if let Some(lane) = lane {
-                for point in &lane.points {
-                    let x = rect.left()
-                        + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width().min(880.0), 34.0),
+                    egui::Sense::click(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
+                for step in (0..=PATTERN_STEPS).step_by(usize::from(STEPS_PER_BEAT)) {
+                    let x = rect.left() + f32::from(step) / f32::from(PATTERN_STEPS) * rect.width();
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(2.0, Color32::WHITE),
+                        egui::Stroke::new(1.0, Color32::from_white_alpha(35)),
                     );
-                    if let AutomationValue::Choice(value) = &point.value {
-                        painter.text(
-                            egui::pos2(x + 4.0, rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            value,
-                            egui::FontId::proportional(11.0),
-                            Color32::WHITE,
+                }
+                let lane = pattern
+                    .automation
+                    .iter()
+                    .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation);
+                for step in 0..PATTERN_STEPS {
+                    let value = lane
+                        .and_then(|lane| lane.value_at(step))
+                        .and_then(|value| match value {
+                            AutomationValue::Choice(value) => Some(value.as_str()),
+                            AutomationValue::Continuous(_) => None,
+                        })
+                        .unwrap_or(default);
+                    let index = articulations
+                        .iter()
+                        .position(|choice| choice == value)
+                        .unwrap_or(0);
+                    let x0 =
+                        rect.left() + f32::from(step) / f32::from(PATTERN_STEPS) * rect.width();
+                    let x1 =
+                        rect.left() + f32::from(step + 1) / f32::from(PATTERN_STEPS) * rect.width();
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, rect.top()),
+                            egui::pos2(x1, rect.bottom()),
+                        ),
+                        0.0,
+                        Color32::from_rgb(
+                            65 + (index as u8 * 31) % 80,
+                            105 + (index as u8 * 47) % 80,
+                            135 + (index as u8 * 19) % 70,
+                        ),
+                    );
+                }
+                if let Some(lane) = lane {
+                    for point in &lane.points {
+                        let x = rect.left()
+                            + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(2.0, Color32::WHITE),
                         );
+                        if let AutomationValue::Choice(value) = &point.value {
+                            painter.text(
+                                egui::pos2(x + 4.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                value,
+                                egui::FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+                if let Some(pointer) = response.hover_pos() {
+                    let step = (((pointer.x - rect.left()) / rect.width())
+                        * f32::from(PATTERN_STEPS))
+                    .floor()
+                    .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
+                    painter.text(
+                        pointer + egui::vec2(8.0, -8.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("Step {step} · paint {articulation_brush}"),
+                        egui::FontId::monospace(10.0),
+                        Color32::WHITE,
+                    );
+                }
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let step = (((pointer.x - rect.left()) / rect.width())
+                        * f32::from(PATTERN_STEPS))
+                    .floor()
+                    .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
+                    upsert_automation_point(
+                        pattern,
+                        AutomationParameter::SamplerArticulation,
+                        AutomationPoint {
+                            step,
+                            value: AutomationValue::Choice(articulation_brush.clone()),
+                        },
+                    );
+                }
+                if response.clicked_by(egui::PointerButton::Secondary)
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let step = (((pointer.x - rect.left()) / rect.width())
+                        * f32::from(PATTERN_STEPS))
+                    .round() as u16;
+                    if let Some(lane) = pattern
+                        .automation
+                        .iter_mut()
+                        .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation)
+                    {
+                        lane.points.retain(|point| point.step.abs_diff(step) > 1);
                     }
                 }
             }
-            if response.clicked_by(egui::PointerButton::Primary)
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Filter cutoff · 20 Hz to 20 kHz");
+                if ui.button("Clear lane").clicked() {
+                    pattern
+                        .automation
+                        .retain(|lane| lane.parameter != cutoff_parameter);
+                }
+            });
+            ui.weak(
+                "Click or drag to draw cutoff. Time runs left to right; frequency runs bottom to top. Right-click a point to remove it.",
+            );
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().min(880.0), 70.0),
+                egui::Sense::click_and_drag(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
+            for step in (0..=PATTERN_STEPS).step_by(usize::from(STEPS_PER_BEAT)) {
+                let x = rect.left() + f32::from(step) / f32::from(PATTERN_STEPS) * rect.width();
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(35)),
+                );
+            }
+            painter.text(
+                rect.right_top() + egui::vec2(-4.0, 3.0),
+                egui::Align2::RIGHT_TOP,
+                "20 kHz",
+                egui::FontId::monospace(9.0),
+                Color32::LIGHT_GRAY,
+            );
+            painter.text(
+                rect.right_bottom() + egui::vec2(-4.0, -3.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "20 Hz",
+                egui::FontId::monospace(9.0),
+                Color32::LIGHT_GRAY,
+            );
+            let lane = pattern
+                .automation
+                .iter()
+                .find(|lane| lane.parameter == cutoff_parameter);
+            let mut previous = None;
+            if let Some(lane) = lane {
+                for point in &lane.points {
+                    let AutomationValue::Continuous(value) = point.value else {
+                        continue;
+                    };
+                    let x = rect.left()
+                        + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
+                    let normalized = (value.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
+                    let position = egui::pos2(x, rect.bottom() - normalized * rect.height());
+                    if let Some(previous) = previous {
+                        painter.line_segment(
+                            [previous, position],
+                            egui::Stroke::new(2.0, Color32::from_rgb(98, 200, 155)),
+                        );
+                    }
+                    painter.circle_filled(position, 4.0, Color32::from_rgb(98, 200, 155));
+                    previous = Some(position);
+                }
+            } else {
+                let normalized = (cutoff_default.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
+                let y = rect.bottom() - normalized * rect.height();
+                painter.line_segment(
+                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    egui::Stroke::new(1.0, Color32::from_gray(80)),
+                );
+            }
+            if let Some(pointer) = response.hover_pos() {
+                let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
+                    .round()
+                    .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
+                let normalized = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                let cutoff = 20.0 * 1_000.0_f32.powf(normalized);
+                painter.text(
+                    pointer + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("Step {step} · {cutoff:.0} Hz"),
+                    egui::FontId::monospace(10.0),
+                    Color32::WHITE,
+                );
+            }
+            if (response.clicked() || response.dragged())
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
-                    .floor()
+                    .round()
                     .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
-                let current = lane
-                    .and_then(|lane| lane.value_at(step))
-                    .and_then(|value| match value {
-                        AutomationValue::Choice(value) => Some(value.as_str()),
-                        AutomationValue::Continuous(_) => None,
-                    })
-                    .unwrap_or(default);
-                let next = articulations
-                    .iter()
-                    .position(|choice| choice == current)
-                    .map_or(0, |index| (index + 1) % articulations.len());
+                let normalized = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
                 upsert_automation_point(
                     pattern,
-                    AutomationParameter::SamplerArticulation,
+                    cutoff_parameter,
                     AutomationPoint {
                         step,
-                        value: AutomationValue::Choice(articulations[next].clone()),
+                        value: AutomationValue::Continuous(20.0 * 1_000.0_f32.powf(normalized)),
                     },
                 );
             }
@@ -2056,81 +2221,12 @@ fn pattern_automation_editor(ui: &mut egui::Ui, pattern: &mut Pattern, kind: &Tr
                 if let Some(lane) = pattern
                     .automation
                     .iter_mut()
-                    .find(|lane| lane.parameter == AutomationParameter::SamplerArticulation)
+                    .find(|lane| lane.parameter == cutoff_parameter)
                 {
                     lane.points.retain(|point| point.step.abs_diff(step) > 1);
                 }
             }
-        }
-
-        ui.label("Filter cutoff");
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().min(880.0), 70.0),
-            egui::Sense::click_and_drag(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(25, 29, 36));
-        let lane = pattern
-            .automation
-            .iter()
-            .find(|lane| lane.parameter == cutoff_parameter);
-        let mut previous = None;
-        if let Some(lane) = lane {
-            for point in &lane.points {
-                let AutomationValue::Continuous(value) = point.value else {
-                    continue;
-                };
-                let x =
-                    rect.left() + f32::from(point.step) / f32::from(PATTERN_STEPS) * rect.width();
-                let normalized = (value.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
-                let position = egui::pos2(x, rect.bottom() - normalized * rect.height());
-                if let Some(previous) = previous {
-                    painter.line_segment(
-                        [previous, position],
-                        egui::Stroke::new(2.0, Color32::from_rgb(98, 200, 155)),
-                    );
-                }
-                painter.circle_filled(position, 4.0, Color32::from_rgb(98, 200, 155));
-                previous = Some(position);
-            }
-        } else {
-            let normalized = (cutoff_default.clamp(20.0, 20_000.0) / 20.0).log10() / 3.0;
-            let y = rect.bottom() - normalized * rect.height();
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(1.0, Color32::from_gray(80)),
-            );
-        }
-        if (response.clicked() || response.dragged())
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
-                .round()
-                .clamp(0.0, f32::from(PATTERN_STEPS - 1)) as u16;
-            let normalized = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
-            upsert_automation_point(
-                pattern,
-                cutoff_parameter,
-                AutomationPoint {
-                    step,
-                    value: AutomationValue::Continuous(20.0 * 1_000.0_f32.powf(normalized)),
-                },
-            );
-        }
-        if response.clicked_by(egui::PointerButton::Secondary)
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let step = (((pointer.x - rect.left()) / rect.width()) * f32::from(PATTERN_STEPS))
-                .round() as u16;
-            if let Some(lane) = pattern
-                .automation
-                .iter_mut()
-                .find(|lane| lane.parameter == cutoff_parameter)
-            {
-                lane.points.retain(|point| point.step.abs_diff(step) > 1);
-            }
-        }
-    });
+        });
 }
 
 fn upsert_automation_point(
