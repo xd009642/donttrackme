@@ -254,14 +254,55 @@ pub fn export_wav(project: &Project, path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not finish the WAV file: {error}"))
 }
 
+pub fn export_track_wav(project: &Project, track_id: u64, path: &Path) -> Result<(), String> {
+    const SAMPLE_RATE: u32 = 44_100;
+    let plan = PlaybackPlan::from_project_channel(project, SAMPLE_RATE as f32, Some(track_id))?;
+    let frame_count = plan.loop_samples;
+    let (_sender, receiver) = mpsc::channel();
+    let mut renderer = Renderer::new(receiver, SAMPLE_RATE as f32);
+    renderer.plan = Some(plan);
+    let specification = hound::WavSpec {
+        channels: 2,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, specification)
+        .map_err(|error| format!("Could not create the rendered track: {error}"))?;
+    for _ in 0..frame_count {
+        let [left, right] = renderer.next_frame();
+        writer
+            .write_sample((left.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+            .and_then(|_| {
+                writer.write_sample((right.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+            })
+            .map_err(|error| format!("Could not write the rendered track: {error}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("Could not finish the rendered track: {error}"))
+}
+
 impl PlaybackPlan {
     fn from_project(project: &Project, sample_rate: f32) -> Result<Self, String> {
+        Self::from_project_channel(project, sample_rate, None)
+    }
+
+    fn from_project_channel(
+        project: &Project,
+        sample_rate: f32,
+        only_track: Option<u64>,
+    ) -> Result<Self, String> {
         let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
         let any_solo = project.tracks.iter().any(|track| track.solo);
         let mut channels = Vec::new();
+        let mut decoded_samples = HashMap::<PathBuf, Arc<SampleBuffer>>::new();
 
         for channel in &project.tracks {
-            if channel.muted || (any_solo && !channel.solo) {
+            if only_track.is_some_and(|track_id| channel.id != track_id) {
+                continue;
+            }
+            if only_track.is_none() && (channel.muted || (any_solo && !channel.solo)) {
                 continue;
             }
             let instrument = match &channel.kind {
@@ -274,63 +315,107 @@ impl PlaybackPlan {
                         sampler: sampler.clone(),
                     }
                 }
-                TrackKind::Sample => continue,
+                TrackKind::Sample => RenderInstrument::Sampler {
+                    sampler: SampleSynth::default(),
+                },
             };
             let mut channel_voices = Vec::new();
-            for lane in project.tracks.iter().filter(|lane| !lane.muted) {
-                for clip in &lane.clips {
-                    let Some(source) = project.source(clip.source_id) else {
+            if matches!(channel.kind, TrackKind::Sample) {
+                for clip in &channel.clips {
+                    let Some(crate::model::ClipSource {
+                        kind: crate::model::ClipSourceKind::Sample { path },
+                        ..
+                    }) = project.source(clip.source_id)
+                    else {
                         continue;
                     };
-                    if source.channel_id != channel.id {
-                        continue;
-                    }
-                    let Some(pattern) = project.pattern(source.id) else {
-                        continue;
+                    let sample = if let Some(sample) = decoded_samples.get(path) {
+                        Arc::clone(sample)
+                    } else {
+                        let sample = Arc::new(load_wav(path)?);
+                        decoded_samples.insert(path.clone(), Arc::clone(&sample));
+                        sample
                     };
-                    for note in &pattern.notes {
-                        if note.start_step >= clip.length_steps {
+                    channel_voices.push(Voice {
+                        start_sample: (f32::from(clip.start_step) * samples_per_step).round()
+                            as u64,
+                        note_off_sample: (f32::from(clip.start_step + clip.length_steps)
+                            * samples_per_step)
+                            .round() as u64,
+                        frequency: 1.0,
+                        glide_from_frequency: 1.0,
+                        gain: 1.0,
+                        filter: FilterState::default(),
+                        sample: Some(sample),
+                    });
+                }
+            } else {
+                for lane in project.tracks.iter().filter(|lane| !lane.muted) {
+                    for clip in &lane.clips {
+                        let Some(source) = project.source(clip.source_id) else {
+                            continue;
+                        };
+                        if source.channel_id != channel.id {
                             continue;
                         }
-                        let start_step = clip.start_step + note.start_step;
-                        if start_step >= ARRANGEMENT_STEPS {
+                        let Some(pattern) = project.pattern(source.id) else {
                             continue;
+                        };
+                        for note in &pattern.notes {
+                            if note.start_step >= clip.length_steps {
+                                continue;
+                            }
+                            let start_step = clip.start_step + note.start_step;
+                            if start_step >= ARRANGEMENT_STEPS {
+                                continue;
+                            }
+                            let end_step = clip.start_step
+                                + (note.start_step + note.length_steps).min(clip.length_steps);
+                            let frequency = match &instrument {
+                                RenderInstrument::Synth(synth) => {
+                                    pitch_frequency(note.pitch, synth.pitch_shift)
+                                }
+                                RenderInstrument::Sampler { sampler } => {
+                                    let (_, root_pitch) =
+                                        select_sample_region(sampler, note.pitch, note.velocity)
+                                            .expect(
+                                                "loaded sampler has at least one sample region",
+                                            );
+                                    2.0_f32.powf(
+                                        (f32::from(note.pitch) - f32::from(root_pitch)) / 12.0,
+                                    ) * sampler.speed
+                                }
+                            };
+                            let sample = match &instrument {
+                                RenderInstrument::Sampler { sampler } => {
+                                    let (path, _) =
+                                        select_sample_region(sampler, note.pitch, note.velocity)
+                                            .expect(
+                                                "loaded sampler has at least one sample region",
+                                            );
+                                    if let Some(sample) = decoded_samples.get(path) {
+                                        Some(Arc::clone(sample))
+                                    } else {
+                                        let sample = Arc::new(load_wav(path)?);
+                                        decoded_samples
+                                            .insert(path.to_owned(), Arc::clone(&sample));
+                                        Some(sample)
+                                    }
+                                }
+                                RenderInstrument::Synth(_) => None,
+                            };
+                            channel_voices.push(Voice {
+                                start_sample: (f32::from(start_step) * samples_per_step).round()
+                                    as u64,
+                                note_off_sample: (f32::from(end_step) * samples_per_step).round()
+                                    as u64,
+                                frequency,
+                                glide_from_frequency: frequency,
+                                gain: f32::from(note.velocity) / 127.0,
+                                filter: FilterState::default(),
+                                sample,
+                            });
                         }
-                        let end_step = clip.start_step
-                            + (note.start_step + note.length_steps).min(clip.length_steps);
-                        let frequency = match &instrument {
-                            RenderInstrument::Synth(synth) => {
-                                pitch_frequency(note.pitch, synth.pitch_shift)
-                            }
-                            RenderInstrument::Sampler { sampler } => {
-                                let (_, root_pitch) =
-                                    select_sample_region(sampler, note.pitch, note.velocity)
-                                        .expect("loaded sampler has at least one sample region");
-                                2.0_f32.powf((f32::from(note.pitch) - f32::from(root_pitch)) / 12.0)
-                                    * sampler.speed
-                            }
-                        };
-                        let sample = match &instrument {
-                            RenderInstrument::Sampler { sampler } => {
-                                let (path, _) =
-                                    select_sample_region(sampler, note.pitch, note.velocity)
-                                        .expect("loaded sampler has at least one sample region");
-                                // TODO: Cache decoded buffers while constructing the plan;
-                                // multisampled chords currently decode duplicate source files.
-                                Some(Arc::new(load_wav(path)?))
-                            }
-                            RenderInstrument::Synth(_) => None,
-                        };
-                        channel_voices.push(Voice {
-                            start_sample: (f32::from(start_step) * samples_per_step).round() as u64,
-                            note_off_sample: (f32::from(end_step) * samples_per_step).round()
-                                as u64,
-                            frequency,
-                            glide_from_frequency: frequency,
-                            gain: f32::from(note.velocity) / 127.0,
-                            filter: FilterState::default(),
-                            sample,
-                        });
                     }
                 }
             }
@@ -395,6 +480,7 @@ impl PlaybackPlan {
             TrackKind::Sample => return Err("Sample tracks do not have patterns".to_owned()),
         };
         let samples_per_step = sample_rate * 60.0 / project.bpm / f32::from(STEPS_PER_BEAT);
+        let mut decoded_samples = HashMap::<PathBuf, Arc<SampleBuffer>>::new();
         let mut voices = pattern
             .notes
             .iter()
@@ -415,9 +501,13 @@ impl PlaybackPlan {
                     RenderInstrument::Sampler { sampler } => {
                         let (path, _) = select_sample_region(sampler, note.pitch, note.velocity)
                             .expect("loaded sampler has at least one sample region");
-                        // TODO: Cache decoded buffers while constructing the plan; multisampled
-                        // chords currently decode duplicate source files.
-                        Some(Arc::new(load_wav(path)?))
+                        if let Some(sample) = decoded_samples.get(path) {
+                            Some(Arc::clone(sample))
+                        } else {
+                            let sample = Arc::new(load_wav(path)?);
+                            decoded_samples.insert(path.to_owned(), Arc::clone(&sample));
+                            Some(sample)
+                        }
                     }
                     RenderInstrument::Synth(_) => None,
                 };
@@ -1216,6 +1306,7 @@ mod tests {
         TrackKind,
     };
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn multisampler_selects_velocity_layer_then_nearest_root() {
@@ -1546,6 +1637,56 @@ mod tests {
         assert!(matches!(
             plan.channels[0].instrument,
             RenderInstrument::Sampler { .. }
+        ));
+    }
+
+    #[test]
+    fn sample_tracks_play_clips_and_share_their_decoded_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "donttrackme-audio-track-{}.wav",
+            std::process::id()
+        ));
+        let specification = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, specification)
+            .expect("audio track fixture should be created");
+        writer
+            .write_sample(i16::MAX / 2)
+            .expect("audio track fixture should contain a sample");
+        writer
+            .finalize()
+            .expect("audio track fixture should be finalized");
+
+        let mut project = Project::default();
+        let track_id = project.add_sample_with_length(path.clone(), 8);
+        let track = project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .expect("sample track should exist");
+        track.add_clip(track.source_id, 8, 8);
+        let plan = PlaybackPlan::from_project(&project, 8_000.0)
+            .expect("sample clips should build a playback plan");
+        std::fs::remove_file(path).expect("audio track fixture should be removable");
+
+        let channel = plan
+            .channels
+            .iter()
+            .find(|channel| channel.voices.len() == 2)
+            .expect("both audio clips should be scheduled");
+        assert!(Arc::ptr_eq(
+            channel.voices[0]
+                .sample
+                .as_ref()
+                .expect("sample voice should have decoded audio"),
+            channel.voices[1]
+                .sample
+                .as_ref()
+                .expect("sample voice should have decoded audio")
         ));
     }
 

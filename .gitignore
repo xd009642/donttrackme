@@ -3,3 +3,4 @@
 # Downloaded sample libraries are reproducible and must not enter Git history.
 /data/samples/iowa/
 /data/samples/_downloads/
+/data/renders/

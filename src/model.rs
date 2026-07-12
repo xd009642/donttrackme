@@ -665,7 +665,7 @@ impl Track {
         }
     }
 
-    pub fn sample(id: u64, source_id: u64, path: PathBuf) -> Self {
+    pub fn sample(id: u64, source_id: u64, path: PathBuf, length_steps: u16) -> Self {
         let name = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -681,17 +681,15 @@ impl Track {
             solo: false,
             next_clip_id: 1,
         };
-        track.add_clip(source_id, 0, 16);
+        track.add_clip(source_id, 0, length_steps);
         track
     }
 
-    pub fn sampler(id: u64, source_id: u64, name: String) -> Self {
+    pub fn sampler(id: u64, source_id: u64, name: String, sampler: SampleSynth) -> Self {
         Self {
             id,
             name,
-            kind: TrackKind::Sampler {
-                sampler: SampleSynth::default(),
-            },
+            kind: TrackKind::Sampler { sampler },
             source_id,
             clips: Vec::new(),
             muted: false,
@@ -763,6 +761,10 @@ impl Project {
     }
 
     pub fn add_sample(&mut self, path: PathBuf) -> u64 {
+        self.add_sample_with_length(path, 16)
+    }
+
+    pub fn add_sample_with_length(&mut self, path: PathBuf, length_steps: u16) -> u64 {
         let id = self.next_track_id;
         self.next_track_id += 1;
         let source_id = self.next_source_id;
@@ -776,35 +778,40 @@ impl Project {
             id: source_id,
             channel_id: id,
             name,
-            length_steps: 16,
+            length_steps,
             kind: ClipSourceKind::Sample { path: path.clone() },
         });
-        self.tracks.push(Track::sample(id, source_id, path));
+        self.tracks
+            .push(Track::sample(id, source_id, path, length_steps));
         id
     }
 
     pub fn add_sampler(&mut self) -> u64 {
-        let id = self.next_track_id;
-        self.next_track_id += 1;
-        let source_id = self.next_source_id;
-        self.next_source_id += 1;
         let number = self
             .tracks
             .iter()
             .filter(|track| matches!(track.kind, TrackKind::Sampler { .. }))
             .count()
             + 1;
+        self.add_configured_sampler(format!("Sampler {number}"), SampleSynth::default())
+    }
+
+    pub fn add_configured_sampler(&mut self, name: String, sampler: SampleSynth) -> u64 {
+        let id = self.next_track_id;
+        self.next_track_id += 1;
+        let source_id = self.next_source_id;
+        self.next_source_id += 1;
         self.clip_library.push(ClipSource {
             id: source_id,
             channel_id: id,
-            name: format!("Sampler pattern {number}"),
+            name: format!("{name} pattern"),
             length_steps: PATTERN_STEPS,
             kind: ClipSourceKind::Pattern {
                 pattern: Pattern::default(),
             },
         });
         self.tracks
-            .push(Track::sampler(id, source_id, format!("Sampler {number}")));
+            .push(Track::sampler(id, source_id, name, sampler));
         id
     }
 

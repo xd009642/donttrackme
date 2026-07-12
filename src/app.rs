@@ -10,8 +10,8 @@ use crate::{
     audio::{self, AudioEngine},
     model::{
         ARRANGEMENT_STEPS, Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Project,
-        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SampleRegion, SimpleWaveformSynth,
-        TrackKind, Waveform, noise_sample,
+        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SampleRegion, SampleSynth,
+        SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
     },
     piano_roll, project_io,
 };
@@ -524,6 +524,7 @@ impl DawApp {
     }
 
     fn track_list(&mut self, root: &mut egui::Ui) {
+        let iowa_library = downloaded_iowa_instruments();
         egui::Panel::left("tracks")
             .default_size(245.0)
             .min_size(220.0)
@@ -538,6 +539,29 @@ impl DawApp {
                         if ui.button("Sampler").clicked() {
                             self.selected_track = Some(self.project.add_sampler());
                             ui.close();
+                        }
+                        if !iowa_library.is_empty() {
+                            ui.menu_button("Iowa instrument", |ui| {
+                                for folder in &iowa_library {
+                                    let name = folder
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("Iowa instrument");
+                                    if ui.button(name).clicked() {
+                                        match sampler_from_iowa_folder(folder) {
+                                            Ok(sampler) => {
+                                                self.selected_track =
+                                                    Some(self.project.add_configured_sampler(
+                                                        name.to_owned(),
+                                                        sampler,
+                                                    ));
+                                                ui.close();
+                                            }
+                                            Err(error) => self.audio_error = Some(error),
+                                        }
+                                    }
+                                }
+                            });
                         }
                     });
                 });
@@ -684,6 +708,7 @@ impl DawApp {
     }
 
     fn arrangement(&mut self, ui: &mut egui::Ui) {
+        let mut prerender_track = None;
         const STEPS: u16 = ARRANGEMENT_STEPS;
         const STEP_WIDTH: f32 = 12.0;
         const TRACK_HEIGHT: f32 = 58.0;
@@ -833,6 +858,11 @@ impl DawApp {
                                 );
                                 self.selected_clip = Some((track.id, id));
                             }
+                        }
+                        if matches!(track.kind, TrackKind::Sampler { .. })
+                            && ui.small_button("Pre-render").clicked()
+                        {
+                            prerender_track = Some(track.id);
                         }
                     });
                     let (rect, response) = ui.allocate_exact_size(
@@ -1032,6 +1062,43 @@ impl DawApp {
                 ui.add_space(4.0);
             }
         });
+        if let Some(track_id) = prerender_track {
+            let render_directory = PathBuf::from("data/renders");
+            let render_path = render_directory.join(format!("sampler-track-{track_id}.wav"));
+            match std::fs::create_dir_all(&render_directory)
+                .map_err(|error| format!("Could not create render directory: {error}"))
+                .and_then(|_| audio::export_track_wav(&self.project, track_id, &render_path))
+            {
+                Ok(()) => {
+                    let source_name = self
+                        .project
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .map(|track| track.name.clone())
+                        .expect("pre-render source track was just selected");
+                    self.project
+                        .tracks
+                        .iter_mut()
+                        .find(|track| track.id == track_id)
+                        .expect("pre-render source track was just selected")
+                        .muted = true;
+                    let rendered_id = self
+                        .project
+                        .add_sample_with_length(render_path, ARRANGEMENT_STEPS);
+                    let rendered = self
+                        .project
+                        .tracks
+                        .iter_mut()
+                        .find(|track| track.id == rendered_id)
+                        .expect("rendered sample track was just inserted");
+                    rendered.name = format!("{source_name} (rendered)");
+                    self.selected_track = Some(rendered_id);
+                    self.project_status = Some(format!("Pre-rendered {source_name}"));
+                }
+                Err(error) => self.audio_error = Some(error),
+            }
+        }
         if let Some((from_track_id, clip_id, pointer)) = clip_drop
             && let Some(to_track_id) = lane_rects
                 .iter()
@@ -1961,6 +2028,23 @@ fn downloaded_iowa_instruments() -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     instruments.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     instruments
+}
+
+fn sampler_from_iowa_folder(folder: &std::path::Path) -> Result<SampleSynth, String> {
+    let regions = discover_iowa_regions(folder)?;
+    let first = regions.first().ok_or_else(|| {
+        format!(
+            "No pitch-named WAV files were found in {}",
+            folder.display()
+        )
+    })?;
+    Ok(SampleSynth {
+        path: Some(first.path.clone()),
+        root_pitch: first.root_pitch,
+        articulation: first.articulation.clone(),
+        regions,
+        ..SampleSynth::default()
+    })
 }
 
 fn parse_note_pitch(value: &str) -> Option<u8> {
