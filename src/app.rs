@@ -709,6 +709,7 @@ impl DawApp {
 
     fn arrangement(&mut self, ui: &mut egui::Ui) {
         let mut prerender_track = None;
+        let mut restore_live_track = None;
         const STEPS: u16 = ARRANGEMENT_STEPS;
         const STEP_WIDTH: f32 = 12.0;
         const TRACK_HEIGHT: f32 = 58.0;
@@ -863,6 +864,11 @@ impl DawApp {
                             && ui.small_button("Pre-render").clicked()
                         {
                             prerender_track = Some(track.id);
+                        }
+                        if let Some(source_id) = track.rendered_from
+                            && ui.small_button("Restore live").clicked()
+                        {
+                            restore_live_track = Some((track.id, source_id));
                         }
                     });
                     let (rect, response) = ui.allocate_exact_size(
@@ -1085,7 +1091,22 @@ impl DawApp {
                         .muted = true;
                     let rendered_id = self
                         .project
-                        .add_sample_with_length(render_path, ARRANGEMENT_STEPS);
+                        .tracks
+                        .iter()
+                        .find(|track| track.rendered_from == Some(track_id))
+                        .map(|track| track.id)
+                        .unwrap_or_else(|| {
+                            let rendered_id = self
+                                .project
+                                .add_sample_with_length(render_path, ARRANGEMENT_STEPS);
+                            self.project
+                                .tracks
+                                .iter_mut()
+                                .find(|track| track.id == rendered_id)
+                                .expect("rendered sample track was just inserted")
+                                .rendered_from = Some(track_id);
+                            rendered_id
+                        });
                     let rendered = self
                         .project
                         .tracks
@@ -1093,10 +1114,32 @@ impl DawApp {
                         .find(|track| track.id == rendered_id)
                         .expect("rendered sample track was just inserted");
                     rendered.name = format!("{source_name} (rendered)");
+                    rendered.muted = false;
                     self.selected_track = Some(rendered_id);
                     self.project_status = Some(format!("Pre-rendered {source_name}"));
                 }
                 Err(error) => self.audio_error = Some(error),
+            }
+        }
+        if let Some((rendered_id, source_id)) = restore_live_track {
+            self.project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == rendered_id)
+                .expect("rendered track requesting restore still exists")
+                .muted = true;
+            if let Some(source) = self
+                .project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == source_id)
+            {
+                source.muted = false;
+                self.selected_track = Some(source_id);
+                self.project_status = Some(format!("Restored live {}", source.name));
+            } else {
+                self.audio_error =
+                    Some("The rendered track's source sampler is missing".to_owned());
             }
         }
         if let Some((from_track_id, clip_id, pointer)) = clip_drop
@@ -1800,6 +1843,14 @@ impl DawApp {
                             egui::Slider::new(&mut sampler.attack_ms, 0.0..=2_000.0)
                                 .text("Attack")
                                 .suffix(" ms"),
+                        );
+                        columns[1].add(
+                            egui::Slider::new(&mut sampler.decay_ms, 0.0..=2_000.0)
+                                .text("Decay")
+                                .suffix(" ms"),
+                        );
+                        columns[0].add(
+                            egui::Slider::new(&mut sampler.sustain, 0.0..=1.0).text("Sustain"),
                         );
                         columns[1].add(
                             egui::Slider::new(&mut sampler.release_ms, 0.0..=5_000.0)

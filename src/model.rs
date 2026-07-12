@@ -170,6 +170,8 @@ pub struct SampleSynth {
     pub gain: f32,
     pub pan: f32,
     pub attack_ms: f32,
+    pub decay_ms: f32,
+    pub sustain: f32,
     pub release_ms: f32,
     pub filter: FilterKind,
     pub filter_cutoff_hz: f32,
@@ -216,6 +218,8 @@ impl Default for SampleSynth {
             gain: 0.8,
             pan: 0.0,
             attack_ms: 0.0,
+            decay_ms: 100.0,
+            sustain: 1.0,
             release_ms: 80.0,
             filter: FilterKind::Off,
             filter_cutoff_hz: 8_000.0,
@@ -646,6 +650,7 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub muted: bool,
     pub solo: bool,
+    pub rendered_from: Option<u64>,
     next_clip_id: u64,
 }
 
@@ -661,6 +666,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            rendered_from: None,
             next_clip_id: 1,
         }
     }
@@ -679,6 +685,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            rendered_from: None,
             next_clip_id: 1,
         };
         track.add_clip(source_id, 0, length_steps);
@@ -694,6 +701,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            rendered_from: None,
             next_clip_id: 1,
         }
     }

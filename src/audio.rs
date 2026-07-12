@@ -596,7 +596,7 @@ struct AuditionSampleVoice {
     sample: Arc<SampleBuffer>,
     playback_rate: f32,
     elapsed: u64,
-    released_at: Option<u64>,
+    released_at: Option<(u64, f32)>,
     filter: FilterState,
     finished: bool,
 }
@@ -666,7 +666,9 @@ impl Renderer {
                         .iter_mut()
                         .filter(|voice| voice.pitch == pitch && voice.released_at.is_none())
                     {
-                        voice.released_at = Some(voice.elapsed);
+                        let level =
+                            held_sample_envelope(&voice.sampler, voice.elapsed, self.sample_rate);
+                        voice.released_at = Some((voice.elapsed, level));
                     }
                 }
                 Command::AuditionSampleStart {
@@ -776,14 +778,12 @@ impl Renderer {
                             if elapsed >= note_length + release {
                                 continue;
                             }
-                            let attack = ms_samples(sampler.attack_ms, self.sample_rate);
-                            let envelope = if elapsed < attack && attack > 0 {
-                                elapsed as f32 / attack as f32
-                            } else if elapsed < note_length {
-                                1.0
+                            let envelope = if elapsed < note_length {
+                                held_sample_envelope(sampler, elapsed, self.sample_rate)
                             } else if release > 0 {
-                                (1.0 - (elapsed - note_length) as f32 / release as f32)
-                                    .clamp(0.0, 1.0)
+                                held_sample_envelope(sampler, note_length, self.sample_rate)
+                                    * (1.0 - (elapsed - note_length) as f32 / release as f32)
+                                        .clamp(0.0, 1.0)
                             } else {
                                 0.0
                             };
@@ -869,23 +869,17 @@ impl Renderer {
         }
         for voice in &mut self.audition_samples {
             let envelope = match voice.released_at {
-                Some(released_at) => {
+                Some((released_at, release_level)) => {
                     let release = ms_samples(voice.sampler.release_ms, self.sample_rate);
                     if release == 0 {
                         0.0
                     } else {
-                        (1.0 - (voice.elapsed - released_at) as f32 / release as f32)
-                            .clamp(0.0, 1.0)
+                        release_level
+                            * (1.0 - (voice.elapsed - released_at) as f32 / release as f32)
+                                .clamp(0.0, 1.0)
                     }
                 }
-                None => {
-                    let attack = ms_samples(voice.sampler.attack_ms, self.sample_rate);
-                    if voice.elapsed < attack && attack > 0 {
-                        voice.elapsed as f32 / attack as f32
-                    } else {
-                        1.0
-                    }
-                }
+                None => held_sample_envelope(&voice.sampler, voice.elapsed, self.sample_rate),
             };
             let Some(frame) = sampler_frame(
                 &voice.sample,
@@ -910,7 +904,7 @@ impl Renderer {
         }
         self.audition_samples.retain(|voice| {
             !voice.finished
-                && voice.released_at.is_none_or(|released_at| {
+                && voice.released_at.is_none_or(|(released_at, _)| {
                     voice.elapsed
                         < released_at + ms_samples(voice.sampler.release_ms, self.sample_rate)
                 })
@@ -1090,6 +1084,19 @@ fn held_envelope(synth: &SimpleWaveformSynth, elapsed: u64, sample_rate: f32) ->
         1.0 + (synth.sustain - 1.0) * progress
     } else {
         synth.sustain
+    }
+}
+
+fn held_sample_envelope(sampler: &SampleSynth, elapsed: u64, sample_rate: f32) -> f32 {
+    let attack = ms_samples(sampler.attack_ms, sample_rate);
+    let decay = ms_samples(sampler.decay_ms, sample_rate);
+    if elapsed < attack && attack > 0 {
+        elapsed as f32 / attack as f32
+    } else if elapsed < attack + decay && decay > 0 {
+        let progress = (elapsed - attack) as f32 / decay as f32;
+        1.0 + (sampler.sustain - 1.0) * progress
+    } else {
+        sampler.sustain
     }
 }
 
@@ -1298,8 +1305,8 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 mod tests {
     use super::{
         EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
-        glide_frequency, held_envelope, note_envelope, pitch_frequency, sampler_frame,
-        select_sample_region,
+        glide_frequency, held_envelope, held_sample_envelope, note_envelope, pitch_frequency,
+        sampler_frame, select_sample_region,
     };
     use crate::model::{
         DEFAULT_EFFECTS, EffectKind, Project, SampleRegion, SampleSynth, SimpleWaveformSynth,
@@ -1341,6 +1348,20 @@ mod tests {
             .expect("a matching multisample region should exist");
         assert_eq!(path, std::path::Path::new("loud-g4.wav"));
         assert_eq!(root, 67);
+    }
+
+    #[test]
+    fn sampler_adsr_decays_to_its_sustain_level() {
+        let sampler = SampleSynth {
+            attack_ms: 100.0,
+            decay_ms: 100.0,
+            sustain: 0.4,
+            ..SampleSynth::default()
+        };
+
+        assert!((held_sample_envelope(&sampler, 50, 1_000.0) - 0.5).abs() < f32::EPSILON);
+        assert!((held_sample_envelope(&sampler, 150, 1_000.0) - 0.7).abs() < f32::EPSILON);
+        assert!((held_sample_envelope(&sampler, 250, 1_000.0) - 0.4).abs() < f32::EPSILON);
     }
 
     #[test]
