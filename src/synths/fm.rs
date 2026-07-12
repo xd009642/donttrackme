@@ -18,9 +18,9 @@ impl FmAlgorithm {
 
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Stack => "4 → 3 → 2 → 1",
-            Self::TwoPairs => "2 → 1 + 4 → 3",
-            Self::ThreeModulators => "2 + 3 + 4 → 1",
+            Self::Stack => "4 -> 3 -> 2 -> 1",
+            Self::TwoPairs => "2 -> 1 + 4 -> 3",
+            Self::ThreeModulators => "2 + 3 + 4 -> 1",
             Self::Additive => "1 + 2 + 3 + 4",
         }
     }
