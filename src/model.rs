@@ -182,6 +182,8 @@ pub struct SampleSynth {
 pub struct SampleRegion {
     pub path: PathBuf,
     pub root_pitch: u8,
+    pub key_min: u8,
+    pub key_max: u8,
     pub velocity_min: u8,
     pub velocity_max: u8,
     pub articulation: String,

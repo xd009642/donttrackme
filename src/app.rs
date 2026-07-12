@@ -143,6 +143,7 @@ pub struct DawApp {
     sampler_trim_drag: Option<TrimHandle>,
     sampler_browser_directory: PathBuf,
     selected_iowa_instrument: Option<PathBuf>,
+    selected_sample_region: Option<usize>,
 }
 
 impl DawApp {
@@ -177,6 +178,7 @@ impl DawApp {
             sampler_browser_directory: std::env::current_dir()
                 .expect("the DAW must start from an accessible working directory"),
             selected_iowa_instrument: None,
+            selected_sample_region: None,
         }
     }
 
@@ -1679,6 +1681,7 @@ impl DawApp {
                                         sampler.root_pitch = regions[0].root_pitch;
                                         sampler.articulation = regions[0].articulation.clone();
                                         sampler.regions = regions;
+                                        self.selected_sample_region = Some(0);
                                         sampler.trim_start = 0.0;
                                         sampler.trim_end = 1.0;
                                     }
@@ -1712,6 +1715,7 @@ impl DawApp {
                             sampler.trim_end = 1.0;
                             sampler.regions.clear();
                             sampler.articulation = "Standard".to_owned();
+                            self.selected_sample_region = None;
                         }
                         if ui.button("Import Iowa instrument").clicked()
                             && let Some(folder) = rfd::FileDialog::new()
@@ -1725,6 +1729,7 @@ impl DawApp {
                                     sampler.root_pitch = regions[0].root_pitch;
                                     sampler.articulation = regions[0].articulation.clone();
                                     sampler.regions = regions;
+                                    self.selected_sample_region = Some(0);
                                     sampler.trim_start = 0.0;
                                     sampler.trim_end = 1.0;
                                 }
@@ -1777,8 +1782,13 @@ impl DawApp {
                                     .expect("the selected articulation came from a sample region");
                                 sampler.path = Some(region.path.clone());
                                 sampler.root_pitch = region.root_pitch;
+                                self.selected_sample_region = sampler
+                                    .regions
+                                    .iter()
+                                    .position(|region| region.articulation == sampler.articulation);
                             }
                         });
+                        sample_region_editor(ui, sampler, &mut self.selected_sample_region);
                     }
                     ui.add_space(8.0);
                     sample_waveform_editor(ui, &self.sampler_waveform, sampler, &mut trim_drag);
@@ -1910,6 +1920,128 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
         }
+    }
+}
+
+fn sample_region_editor(
+    ui: &mut egui::Ui,
+    sampler: &mut SampleSynth,
+    selected_region: &mut Option<usize>,
+) {
+    ui.add_space(8.0);
+    ui.label("Key and velocity map");
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().min(880.0), 180.0),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(22, 25, 31));
+    for velocity in [42_u8, 84] {
+        let y = rect.bottom() - f32::from(velocity) / 127.0 * rect.height();
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0, Color32::from_gray(55)),
+        );
+    }
+    for (index, region) in sampler
+        .regions
+        .iter()
+        .enumerate()
+        .filter(|(_, region)| region.articulation == sampler.articulation)
+    {
+        let left = rect.left() + f32::from(region.key_min - 12) / 121.0 * rect.width();
+        let right = rect.left() + f32::from(region.key_max - 11) / 121.0 * rect.width();
+        let top = rect.bottom() - f32::from(region.velocity_max) / 127.0 * rect.height();
+        let bottom = rect.bottom()
+            - f32::from(region.velocity_min.saturating_sub(1)) / 127.0 * rect.height();
+        let area = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
+        let hue = region.root_pitch.wrapping_mul(29);
+        painter.rect_filled(
+            area.shrink(1.0),
+            2.0,
+            Color32::from_rgb(65 + hue % 55, 105 + hue % 70, 145 + hue % 65),
+        );
+        painter.rect_stroke(
+            area,
+            2.0,
+            egui::Stroke::new(
+                if *selected_region == Some(index) {
+                    2.0
+                } else {
+                    1.0
+                },
+                if *selected_region == Some(index) {
+                    Color32::WHITE
+                } else {
+                    Color32::from_black_alpha(130)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        if response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pointer| area.contains(pointer))
+        {
+            *selected_region = Some(index);
+        }
+    }
+
+    painter.text(
+        rect.left_top() + egui::vec2(5.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        "127",
+        egui::FontId::monospace(10.0),
+        Color32::LIGHT_GRAY,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(5.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        "1",
+        egui::FontId::monospace(10.0),
+        Color32::LIGHT_GRAY,
+    );
+
+    if let Some(index) = *selected_region
+        && let Some(region) = sampler.regions.get_mut(index)
+        && region.articulation == sampler.articulation
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                region
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Selected region"),
+            );
+            ui.add(
+                egui::Slider::new(&mut region.root_pitch, 12..=132)
+                    .text("Root")
+                    .integer(),
+            );
+            ui.add(
+                egui::Slider::new(&mut region.key_min, 12..=region.key_max)
+                    .text("Key low")
+                    .integer(),
+            );
+            ui.add(
+                egui::Slider::new(&mut region.key_max, region.key_min..=132)
+                    .text("Key high")
+                    .integer(),
+            );
+            ui.add(
+                egui::Slider::new(&mut region.velocity_min, 1..=region.velocity_max)
+                    .text("Velocity low")
+                    .integer(),
+            );
+            ui.add(
+                egui::Slider::new(&mut region.velocity_max, region.velocity_min..=127)
+                    .text("Velocity high")
+                    .integer(),
+            );
+        });
+        sampler.path = Some(region.path.clone());
+        sampler.root_pitch = region.root_pitch;
     }
 }
 
@@ -2051,6 +2183,8 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
             regions.push(SampleRegion {
                 path,
                 root_pitch,
+                key_min: root_pitch,
+                key_max: root_pitch,
                 velocity_min,
                 velocity_max,
                 articulation,
@@ -2064,6 +2198,26 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
             right.velocity_min,
         ))
     });
+    for index in 0..regions.len() {
+        let roots = regions
+            .iter()
+            .filter(|region| {
+                region.articulation == regions[index].articulation
+                    && region.velocity_min == regions[index].velocity_min
+                    && region.velocity_max == regions[index].velocity_max
+            })
+            .map(|region| region.root_pitch)
+            .collect::<Vec<_>>();
+        let root = regions[index].root_pitch;
+        let previous = roots.iter().copied().filter(|pitch| *pitch < root).max();
+        let next = roots.iter().copied().filter(|pitch| *pitch > root).min();
+        regions[index].key_min = previous.map_or(12, |pitch| {
+            ((u16::from(pitch) + u16::from(root)) / 2 + 1) as u8
+        });
+        regions[index].key_max = next.map_or(132, |pitch| {
+            ((u16::from(root) + u16::from(pitch)) / 2) as u8
+        });
+    }
     Ok(regions)
 }
 
@@ -2367,7 +2521,11 @@ mod tests {
         let folder =
             std::env::temp_dir().join(format!("donttrackme-iowa-regions-{}", std::process::id()));
         std::fs::create_dir_all(&folder).expect("temporary Iowa folder should be created");
-        for name in ["Violin.arco.pp.C4.wav", "Violin.pizz.ff.D4.wav"] {
+        for name in [
+            "Violin.arco.pp.C4.wav",
+            "Violin.arco.pp.G4.wav",
+            "Violin.pizz.ff.D4.wav",
+        ] {
             std::fs::File::create(folder.join(name)).expect("empty fixture WAV should be created");
         }
 
@@ -2376,9 +2534,11 @@ mod tests {
 
         assert_eq!(regions[0].articulation, "arco");
         assert_eq!((regions[0].velocity_min, regions[0].velocity_max), (1, 42));
-        assert_eq!(regions[1].articulation, "pizz");
+        assert_eq!((regions[0].key_min, regions[0].key_max), (12, 63));
+        assert_eq!((regions[1].key_min, regions[1].key_max), (64, 132));
+        assert_eq!(regions[2].articulation, "pizz");
         assert_eq!(
-            (regions[1].velocity_min, regions[1].velocity_max),
+            (regions[2].velocity_min, regions[2].velocity_max),
             (85, 127)
         );
     }

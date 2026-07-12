@@ -1144,6 +1144,7 @@ fn select_sample_region(sampler: &SampleSynth, pitch: u8, velocity: u8) -> Optio
         .regions
         .iter()
         .filter(|region| region.articulation == sampler.articulation)
+        .filter(|region| (region.key_min..=region.key_max).contains(&pitch))
         .filter(|region| (region.velocity_min..=region.velocity_max).contains(&velocity));
     if let Some(region) = matching_velocity.min_by_key(|region| region.root_pitch.abs_diff(pitch)) {
         return Some((&region.path, region.root_pitch));
@@ -1322,6 +1323,8 @@ mod tests {
                 SampleRegion {
                     path: PathBuf::from("soft-c4.wav"),
                     root_pitch: 60,
+                    key_min: 12,
+                    key_max: 132,
                     velocity_min: 1,
                     velocity_max: 84,
                     articulation: "Standard".to_owned(),
@@ -1329,6 +1332,8 @@ mod tests {
                 SampleRegion {
                     path: PathBuf::from("loud-c4.wav"),
                     root_pitch: 60,
+                    key_min: 12,
+                    key_max: 63,
                     velocity_min: 85,
                     velocity_max: 127,
                     articulation: "Standard".to_owned(),
@@ -1336,6 +1341,8 @@ mod tests {
                 SampleRegion {
                     path: PathBuf::from("loud-g4.wav"),
                     root_pitch: 67,
+                    key_min: 64,
+                    key_max: 132,
                     velocity_min: 85,
                     velocity_max: 127,
                     articulation: "Standard".to_owned(),
