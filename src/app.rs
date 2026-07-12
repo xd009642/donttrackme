@@ -2444,7 +2444,7 @@ fn discover_iowa_regions(folder: &std::path::Path) -> Result<Vec<SampleRegion>, 
             right.velocity_min,
         ))
     });
-    if contains_chromatic_scales {
+    if regions.is_empty() && contains_chromatic_scales {
         return Err(format!(
             "{} contains chromatic-scale WAV files that must be split into individual notes before import",
             folder.display()

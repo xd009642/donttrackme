@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from pathlib import Path
 
 COLLECTION_URL = "https://theremin.music.uiowa.edu/MIS.html"
 USER_AGENT = "donttrackme-sample-fetcher/1.0"
+NOTE_RANGE = re.compile(r"^([A-G](?:b|#)?-?\d+)([A-G](?:b|#)?-?\d+)$")
 
 
 class Links(HTMLParser):
@@ -143,6 +145,140 @@ def convert_to_wav(source: Path, destination: Path) -> None:
     )
 
 
+def note_pitch(name: str) -> int:
+    semitones = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    match = re.fullmatch(r"([A-G])([b#]?)(-?\d+)", name)
+    if match is None:
+        raise ValueError(f"Invalid note name: {name}")
+    letter, accidental, octave = match.groups()
+    return (int(octave) + 1) * 12 + semitones[letter] + {"b": -1, "": 0, "#": 1}[accidental]
+
+
+def pitch_name(pitch: int) -> str:
+    names = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+    return f"{names[pitch % 12]}{pitch // 12 - 1}"
+
+
+def split_chromatic_scale(source: Path) -> bool:
+    parts = source.stem.split(".")
+    range_part = next((part for part in parts if NOTE_RANGE.fullmatch(part)), None)
+    if range_part is None:
+        return False
+    match = NOTE_RANGE.fullmatch(range_part)
+    assert match is not None
+    first_pitch = note_pitch(match.group(1))
+    last_pitch = note_pitch(match.group(2))
+    if last_pitch < first_pitch:
+        print(f"Cannot split descending range {source.name}", file=sys.stderr)
+        return False
+    expected = last_pitch - first_pitch + 1
+    intervals = []
+    duration = 0.0
+    detected_counts = set()
+    for threshold in [-45, -40, -35, -30, -25, -50, -55, -60]:
+        for silence_duration in [0.5, 0.7, 0.9, 0.3]:
+            analysis = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-i",
+                    str(source),
+                    "-af",
+                    f"silencedetect=noise={threshold}dB:d={silence_duration}",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if analysis.returncode != 0:
+                print(f"Could not analyse chromatic scale {source}", file=sys.stderr)
+                return False
+            duration_match = re.search(
+                r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", analysis.stderr
+            )
+            if duration_match is None:
+                print(f"Could not determine duration of {source}", file=sys.stderr)
+                return False
+            duration = (
+                int(duration_match.group(1)) * 3_600
+                + int(duration_match.group(2)) * 60
+                + float(duration_match.group(3))
+            )
+            silence_starts = [
+                float(value)
+                for value in re.findall(r"silence_start: ([0-9.]+)", analysis.stderr)
+            ]
+            silence_ends = [
+                float(value)
+                for value in re.findall(r"silence_end: ([0-9.]+)", analysis.stderr)
+            ]
+            candidate = []
+            cursor = 0.0
+            for silence_start, silence_end in zip(
+                silence_starts, silence_ends, strict=True
+            ):
+                if silence_start > cursor + 0.05:
+                    candidate.append((cursor, silence_start))
+                cursor = silence_end
+            if cursor < duration - 0.05:
+                candidate.append((cursor, duration))
+            detected_counts.add(len(candidate))
+            if len(candidate) == expected:
+                intervals = candidate
+                break
+        if intervals:
+            break
+    if not intervals:
+        print(
+            f"Skipping {source.name}: detected counts {sorted(detected_counts)}, expected {expected}",
+            file=sys.stderr,
+        )
+        return False
+
+    temporary_outputs = []
+    for offset, (start, end) in enumerate(intervals):
+        output_parts = [pitch_name(first_pitch + offset) if part == range_part else part for part in parts]
+        destination = source.with_name(".".join(output_parts) + ".wav")
+        temporary = destination.with_suffix(".wav.part")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{max(0.0, start - 0.02):.6f}",
+                "-to",
+                f"{min(duration, end + 0.05):.6f}",
+                "-i",
+                str(source),
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "wav",
+                str(temporary),
+            ],
+            check=True,
+        )
+        temporary_outputs.append((temporary, destination))
+    for temporary, destination in temporary_outputs:
+        temporary.replace(destination)
+    source.unlink()
+    print(f"Split {source.name} into {expected} notes")
+    return True
+
+
+def split_downloaded_scales(output_root: Path) -> int:
+    split_count = 0
+    for source in sorted(output_root.rglob("*.wav")):
+        split_count += int(split_chromatic_scale(source))
+    return split_count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -152,10 +288,22 @@ def main() -> int:
         help="download page names containing this text; may be repeated",
     )
     parser.add_argument("--list", action="store_true", help="list instrument page names")
+    parser.add_argument(
+        "--process-existing",
+        action="store_true",
+        help="split previously downloaded chromatic-scale WAVs without downloading",
+    )
     args = parser.parse_args()
 
     if shutil.which("ffmpeg") is None and not args.list:
         parser.error("ffmpeg is required to convert the Iowa AIFF recordings to WAV")
+
+    root = Path(__file__).resolve().parent
+    output_root = root / "iowa"
+    if args.process_existing:
+        count = split_downloaded_scales(output_root)
+        print(f"Split {count} chromatic-scale recording(s)")
+        return 0
 
     pages = instrument_pages()
     if args.list:
@@ -171,9 +319,7 @@ def main() -> int:
     if not selected:
         parser.error("no instrument page matched --instrument")
 
-    root = Path(__file__).resolve().parent
     cache = root / "_downloads"
-    output_root = root / "iowa"
     manifest: list[dict[str, object]] = []
     for name, page_url in sorted(selected.items()):
         links = page_links(page_url)
@@ -209,9 +355,7 @@ def main() -> int:
 
         for source in source_files:
             convert_to_wav(source, instrument_output / f"{source.stem}.wav")
-        # TODO: Split Iowa chromatic-scale recordings (for example C2B2) into individual
-        # note WAVs using onset/silence detection. The DAW intentionally refuses to map a
-        # whole scale recording as though it were one pitched sample.
+        split_downloaded_scales(instrument_output)
         manifest.append(
             {
                 "instrument": name,
