@@ -1333,17 +1333,32 @@ impl DawApp {
                 .inner_margin(16.0)
                 .show(ui, |ui| {
                     ui.heading("Presets");
-                    ui.horizontal_wrapped(|ui| {
-                        for preset in SimpleWaveformSynth::PRESETS {
-                            if ui
-                                .button(preset.name)
-                                .on_hover_text(preset.category)
-                                .clicked()
-                            {
-                                *synth = preset.synth;
+                    egui::ComboBox::from_id_salt("waveform-synth-preset")
+                        .selected_text("Choose preset…")
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            let mut categories = Vec::new();
+                            for preset in SimpleWaveformSynth::PRESETS {
+                                if !categories.contains(&preset.category) {
+                                    categories.push(preset.category);
+                                }
                             }
-                        }
-                    });
+                            for (index, category) in categories.into_iter().enumerate() {
+                                if index > 0 {
+                                    ui.separator();
+                                }
+                                ui.label(egui::RichText::new(category).strong());
+                                for preset in SimpleWaveformSynth::PRESETS
+                                    .iter()
+                                    .filter(|preset| preset.category == category)
+                                {
+                                    if ui.selectable_label(false, preset.name).clicked() {
+                                        *synth = preset.synth;
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        });
                 });
             ui.add_space(10.0);
             egui::Frame::group(ui.style())
