@@ -3,6 +3,7 @@ mod audio;
 mod model;
 mod piano_roll;
 mod project_io;
+mod synths;
 
 use app::DawApp;
 

@@ -11,10 +11,12 @@ use crate::{
     model::{
         ARRANGEMENT_STEPS, AutomationLane, AutomationParameter, AutomationPoint, AutomationValue,
         Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Pattern, Project,
-        STEPS_PER_BAR, STEPS_PER_BEAT, SampleLoopMode, SampleRegion, SampleSynth,
-        SimpleWaveformSynth, TrackKind, Waveform, noise_sample,
+        STEPS_PER_BAR, STEPS_PER_BEAT, TrackKind,
     },
     piano_roll, project_io,
+    synths::{
+        SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth, Waveform, noise_sample,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2395,7 +2397,7 @@ fn sample_region_editor(
 fn sample_waveform_editor(
     ui: &mut egui::Ui,
     waveform: &[[f32; 2]],
-    sampler: &mut crate::model::SampleSynth,
+    sampler: &mut SampleSynth,
     trim_drag: &mut Option<TrimHandle>,
 ) {
     let width = ui.available_width().min(880.0);

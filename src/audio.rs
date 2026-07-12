@@ -15,9 +15,9 @@ use cpal::{
 
 use crate::model::{
     ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, DEFAULT_EFFECTS, EffectKind,
-    EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT, SampleSynth, SimpleWaveformSynth,
-    TrackKind, noise_sample,
+    EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT, TrackKind,
 };
+use crate::synths::{SampleLoopMode, SampleSynth, SimpleWaveformSynth, noise_sample};
 
 enum Command {
     Play(PlaybackPlan),
@@ -1268,8 +1268,8 @@ fn sampler_frame(
     let length = (end - start) as f32;
     let position = if sampler.looping {
         match sampler.loop_mode {
-            crate::model::SampleLoopMode::Forward => position % length,
-            crate::model::SampleLoopMode::PingPong => {
+            SampleLoopMode::Forward => position % length,
+            SampleLoopMode::PingPong => {
                 let span = (length - 1.0).max(0.0);
                 if span == 0.0 {
                     0.0
@@ -1394,8 +1394,9 @@ mod tests {
     };
     use crate::model::{
         AutomationLane, AutomationParameter, AutomationPoint, AutomationValue, DEFAULT_EFFECTS,
-        EffectKind, Pattern, Project, SampleRegion, SampleSynth, SimpleWaveformSynth, TrackKind,
+        EffectKind, Pattern, Project, TrackKind,
     };
+    use crate::synths::{SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1680,10 +1681,10 @@ mod tests {
             frames: vec![[0.0, 0.0], [0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
             sample_rate: 4.0,
         };
-        let mut sampler = crate::model::SampleSynth {
+        let mut sampler = SampleSynth {
             trim_start: 0.25,
             trim_end: 0.75,
-            ..crate::model::SampleSynth::default()
+            ..SampleSynth::default()
         };
 
         assert_eq!(
@@ -1703,16 +1704,16 @@ mod tests {
             frames: vec![[0.0, 0.0], [0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
             sample_rate: 4.0,
         };
-        let mut sampler = crate::model::SampleSynth {
+        let mut sampler = SampleSynth {
             looping: true,
-            ..crate::model::SampleSynth::default()
+            ..SampleSynth::default()
         };
 
         assert_eq!(
             sampler_frame(&sample, &sampler, 4, 1.0, 4.0),
             Some([0.0, 0.0])
         );
-        sampler.loop_mode = crate::model::SampleLoopMode::PingPong;
+        sampler.loop_mode = SampleLoopMode::PingPong;
         assert_eq!(
             sampler_frame(&sample, &sampler, 4, 1.0, 4.0),
             Some([0.5, 0.5])
