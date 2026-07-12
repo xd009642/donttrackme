@@ -1680,6 +1680,7 @@ mod tests {
     #[test]
     fn playback_plan_places_and_trims_notes_with_the_clip() {
         let mut project = Project::default();
+        project.add_instrument();
         project.bpm = 60.0;
         let pattern_id = project.tracks[0].source_id;
         project
@@ -1701,6 +1702,7 @@ mod tests {
     #[test]
     fn muted_tracks_are_not_scheduled() {
         let mut project = Project::default();
+        project.add_instrument();
         let pattern_id = project.tracks[0].source_id;
         project
             .add_note(pattern_id, 60, 0, 1, 100)
@@ -1755,6 +1757,7 @@ mod tests {
     #[test]
     fn mono_arrangement_voices_glide_from_the_previous_note() {
         let mut project = Project::default();
+        project.add_instrument();
         let track = &mut project.tracks[0];
         let TrackKind::Instrument { synth } = &mut track.kind else {
             panic!("the default track is an instrument");
@@ -1787,6 +1790,7 @@ mod tests {
     #[test]
     fn wav_export_writes_stereo_pcm_audio() {
         let mut project = Project::default();
+        project.add_instrument();
         project.bpm = 300.0;
         let pattern_id = project.tracks[0].source_id;
         project
@@ -1811,6 +1815,7 @@ mod tests {
     #[test]
     fn pattern_plays_from_its_channel_when_placed_on_another_lane() {
         let mut project = Project::default();
+        project.add_instrument();
         let source_id = project.tracks[0].source_id;
         project
             .add_note(source_id, 69, 0, 2, 127)
@@ -1946,6 +1951,7 @@ mod tests {
             .expect("test sample should be finalizable");
 
         let mut project = Project::default();
+        project.add_instrument();
         let channel_id = project.add_sampler();
         let channel = project
             .tracks
@@ -1996,6 +2002,7 @@ mod tests {
             .expect("audio track fixture should be finalized");
 
         let mut project = Project::default();
+        project.add_instrument();
         let track_id = project.add_sample_with_length(path.clone(), 8);
         let track = project
             .tracks
@@ -2027,6 +2034,7 @@ mod tests {
     #[test]
     fn pattern_playback_ignores_the_rest_of_the_arrangement() {
         let mut project = Project::default();
+        project.add_instrument();
         let first_pattern = project.tracks[0].source_id;
         project
             .add_note(first_pattern, 60, 0, 2, 100)
@@ -2054,6 +2062,7 @@ mod tests {
     #[test]
     fn pausing_does_not_advance_the_playback_position() {
         let mut project = Project::default();
+        project.add_instrument();
         let pattern_id = project.tracks[0].source_id;
         project
             .add_note(pattern_id, 60, 0, 2, 100)

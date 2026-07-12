@@ -358,15 +358,13 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        let mut project = Self {
+        Self {
             bpm: 120.0,
             tracks: Vec::new(),
             clip_library: Vec::new(),
             next_track_id: 1,
             next_source_id: 1,
-        };
-        project.add_instrument();
-        project
+        }
     }
 }
 
@@ -552,6 +550,14 @@ mod tests {
     use crate::synths::{SimpleWaveformSynth, Waveform, noise_sample};
 
     #[test]
+    fn new_projects_start_without_an_implicit_instrument() {
+        let project = Project::default();
+
+        assert!(project.tracks.is_empty());
+        assert!(project.clip_library.is_empty());
+    }
+
+    #[test]
     fn continuous_automation_interpolates_between_points() {
         let lane = AutomationLane {
             parameter: AutomationParameter::SynthFilterCutoff,
@@ -663,6 +669,7 @@ mod tests {
     #[test]
     fn pattern_clip_is_created_once() {
         let mut project = Project::default();
+        project.add_instrument();
         let channel_id = project.tracks[0].id;
 
         project.ensure_primary_pattern_clip(channel_id);
@@ -677,6 +684,7 @@ mod tests {
     #[test]
     fn trimming_clip_preserves_source_length() {
         let mut project = Project::default();
+        project.add_instrument();
         let channel_id = project.tracks[0].id;
         project.ensure_primary_pattern_clip(channel_id);
         let source_id = project.tracks[0].clips[0].source_id;
@@ -692,6 +700,7 @@ mod tests {
     #[test]
     fn patterns_on_one_instrument_have_independent_notes() {
         let mut project = Project::default();
+        project.add_instrument();
         let channel_id = project.tracks[0].id;
         let first = project.tracks[0].source_id;
         let second = project.add_pattern(channel_id);

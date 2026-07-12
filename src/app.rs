@@ -160,7 +160,7 @@ impl DawApp {
         };
         Self {
             project: Project::default(),
-            selected_track: Some(1),
+            selected_track: None,
             view: View::Arrangement,
             playing: false,
             transport_paused: false,

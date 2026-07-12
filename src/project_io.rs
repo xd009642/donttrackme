@@ -49,6 +49,7 @@ mod tests {
     #[test]
     fn project_round_trip_preserves_editable_state() {
         let mut project = Project::default();
+        project.add_instrument();
         project.bpm = 137.5;
         let pattern_id = project.tracks[0].source_id;
         project
