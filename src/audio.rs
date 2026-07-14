@@ -107,6 +107,7 @@ struct Voice {
     // slice samples filter cutoff at note-on, which proves shared synth/sampler targeting but
     // does not yet sweep a note that is already sounding.
     automated_filter_cutoff: Option<f32>,
+    fm_operator_frequencies: [f32; 4],
     fm_feedback: f32,
 }
 
@@ -162,7 +163,9 @@ impl AudioEngine {
             .map_err(|error| format!("Could not read the default audio configuration: {error}"))?;
         let sample_rate = supported.sample_rate() as f32;
         let buffer_size = match supported.buffer_size() {
-            SupportedBufferSize::Range { min, max } => BufferSize::Fixed(1_024_u32.clamp(*min, *max)),
+            SupportedBufferSize::Range { min, max } => {
+                BufferSize::Fixed(1_024_u32.clamp(*min, *max))
+            }
             SupportedBufferSize::Unknown => BufferSize::Default,
         };
         let mut config = supported.config();
@@ -477,6 +480,7 @@ impl PlaybackPlan {
                         filter: FilterState::default(),
                         sample: Some(sample),
                         automated_filter_cutoff: None,
+                        fm_operator_frequencies: [0.0; 4],
                         fm_feedback: 0.0,
                     });
                 }
@@ -567,6 +571,12 @@ impl PlaybackPlan {
                                     note.start_step,
                                     &instrument,
                                 ),
+                                fm_operator_frequencies: match &instrument {
+                                    RenderInstrument::Fm(synth) => {
+                                        fm_operator_frequencies(synth, frequency)
+                                    }
+                                    _ => [0.0; 4],
+                                },
                                 fm_feedback: 0.0,
                             });
                         }
@@ -691,6 +701,10 @@ impl PlaybackPlan {
                         note.start_step,
                         &instrument,
                     ),
+                    fm_operator_frequencies: match &instrument {
+                        RenderInstrument::Fm(synth) => fm_operator_frequencies(synth, frequency),
+                        _ => [0.0; 4],
+                    },
                     fm_feedback: 0.0,
                 })
             })
@@ -811,6 +825,7 @@ struct AuditionFmVoice {
     elapsed: u64,
     released_at: Option<u64>,
     feedback: f32,
+    operator_frequencies: [f32; 4],
 }
 
 struct AuditionDrumVoice {
@@ -948,6 +963,10 @@ impl Renderer {
                         elapsed: 0,
                         released_at: None,
                         feedback: 0.0,
+                        operator_frequencies: fm_operator_frequencies(
+                            &synth,
+                            pitch_frequency(pitch, 0),
+                        ),
                     });
                 }
                 Command::AuditionDrumStart {
@@ -1132,6 +1151,10 @@ impl Renderer {
                     elapsed: 0,
                     released_at: None,
                     feedback: 0.0,
+                    operator_frequencies: fm_operator_frequencies(
+                        &synth,
+                        pitch_frequency(note.pitch, 0),
+                    ),
                 });
             }
             HeldArpeggiatorInstrument::Sampler {
@@ -1253,7 +1276,7 @@ impl Renderer {
                                 synth,
                                 elapsed,
                                 note_length,
-                                voice.frequency,
+                                voice.fm_operator_frequencies,
                                 self.sample_rate,
                                 &mut voice.fm_feedback,
                             ) * voice.gain
@@ -1435,12 +1458,11 @@ impl Renderer {
         });
         for voice in &mut self.audition_fm {
             let note_length = voice.released_at.unwrap_or(u64::MAX);
-            let frequency = pitch_frequency(voice.pitch, 0);
             let raw = fm_sample(
                 &voice.synth,
                 voice.elapsed,
                 note_length,
-                frequency,
+                voice.operator_frequencies,
                 self.sample_rate,
                 &mut voice.feedback,
             ) * voice.synth.master_level;
@@ -1740,19 +1762,25 @@ fn drum_voice_duration_samples(synth: &DrumMachineSynth, pitch: u8, sample_rate:
     )
 }
 
+fn fm_operator_frequencies(synth: &FmSynth, frequency: f32) -> [f32; 4] {
+    synth
+        .operators
+        .map(|operator| frequency * operator.ratio * 2.0_f32.powf(operator.detune_cents / 1_200.0))
+}
+
 fn fm_sample(
     synth: &FmSynth,
     elapsed: u64,
     note_length: u64,
-    frequency: f32,
+    operator_frequencies: [f32; 4],
     sample_rate: f32,
     feedback_state: &mut f32,
 ) -> f32 {
     let mut phases = [0.0; 4];
     let mut levels = [0.0; 4];
-    for (index, operator) in synth.operators.iter().enumerate() {
-        let operator_frequency =
-            frequency * operator.ratio * 2.0_f32.powf(operator.detune_cents / 1_200.0);
+    for (index, (operator, operator_frequency)) in
+        synth.operators.iter().zip(operator_frequencies).enumerate()
+    {
         phases[index] =
             std::f32::consts::TAU * (elapsed as f32 * operator_frequency / sample_rate).fract();
         levels[index] =
@@ -2059,8 +2087,9 @@ mod tests {
     use super::{
         EffectChain, HeldArpeggiatorInstrument, HeldArpeggiatorNote, PlaybackPlan,
         RenderInstrument, Renderer, SampleBuffer, add_panned, arpeggiator_sequence, drum_sample,
-        export_wav, fm_sample, glide_frequency, held_envelope, held_sample_envelope, note_envelope,
-        pattern_articulation, pitch_frequency, sampler_frame, select_sample_region,
+        export_wav, fm_operator_frequencies, fm_sample, glide_frequency, held_envelope,
+        held_sample_envelope, note_envelope, pattern_articulation, pitch_frequency, sampler_frame,
+        select_sample_region,
     };
     use crate::model::{
         ArpeggiatorOrder, ArpeggiatorSettings, AutomationLane, AutomationParameter,
@@ -2118,10 +2147,11 @@ mod tests {
     fn fm_algorithms_produce_distinct_finite_samples() {
         let mut synth = FmSynth::default();
         let mut feedback = 0.0;
-        let stack = fm_sample(&synth, 137, 1_000, 220.0, 44_100.0, &mut feedback);
+        let frequencies = fm_operator_frequencies(&synth, 220.0);
+        let stack = fm_sample(&synth, 137, 1_000, frequencies, 44_100.0, &mut feedback);
         synth.algorithm = FmAlgorithm::Additive;
         feedback = 0.0;
-        let additive = fm_sample(&synth, 137, 1_000, 220.0, 44_100.0, &mut feedback);
+        let additive = fm_sample(&synth, 137, 1_000, frequencies, 44_100.0, &mut feedback);
 
         assert!(stack.is_finite());
         assert!(additive.is_finite());
