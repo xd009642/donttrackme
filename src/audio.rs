@@ -9,17 +9,18 @@ use std::{
 };
 
 use cpal::{
-    FromSample, Sample, SampleFormat, SizedSample, Stream,
+    BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, SupportedBufferSize,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
 use crate::model::{
-    ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, EffectKind, EffectSlot, FilterKind,
-    Pattern, Project, STEPS_PER_BEAT, TrackKind,
+    ARRANGEMENT_STEPS, ArpeggiatorOrder, ArpeggiatorSettings, AutomationParameter, AutomationValue,
+    DEFAULT_EFFECTS, EffectKind, EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT,
+    TrackKind,
 };
 use crate::synths::{
-    FmAlgorithm, FmOperator, FmSynth, SampleLoopMode, SampleSynth, SimpleWaveformSynth,
-    noise_sample,
+    DrumMachineSynth, DrumVoiceKind, FmAlgorithm, FmOperator, FmSynth, SampleLoopMode, SampleSynth,
+    SimpleWaveformSynth, noise_sample,
 };
 
 enum Command {
@@ -33,10 +34,19 @@ enum Command {
         pitch: u8,
         synth: SimpleWaveformSynth,
         effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
     },
     AuditionFmStart {
         pitch: u8,
         synth: FmSynth,
+        effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
+    },
+    AuditionDrumStart {
+        pitch: u8,
+        synth: DrumMachineSynth,
         effects: [EffectSlot; 5],
     },
     AuditionStop {
@@ -48,6 +58,8 @@ enum Command {
         sampler: SampleSynth,
         sample: Arc<SampleBuffer>,
         effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
     },
 }
 
@@ -60,11 +72,20 @@ struct ChannelPlan {
     instrument: RenderInstrument,
     voices: Vec<Voice>,
     effects: EffectChain,
+    next_drum_voice: usize,
+    active_drum_voices: Vec<ActiveDrumVoice>,
+}
+
+struct ActiveDrumVoice {
+    pitch: u8,
+    start_sample: u64,
+    gain: f32,
 }
 
 enum RenderInstrument {
     Synth(SimpleWaveformSynth),
     Fm(FmSynth),
+    DrumMachine(DrumMachineSynth),
     Sampler { sampler: SampleSynth },
 }
 
@@ -74,6 +95,7 @@ struct SampleBuffer {
 }
 
 struct Voice {
+    pitch: u8,
     start_sample: u64,
     note_off_sample: u64,
     frequency: f32,
@@ -139,7 +161,12 @@ impl AudioEngine {
             .default_output_config()
             .map_err(|error| format!("Could not read the default audio configuration: {error}"))?;
         let sample_rate = supported.sample_rate() as f32;
-        let config = supported.config();
+        let buffer_size = match supported.buffer_size() {
+            SupportedBufferSize::Range { min, max } => BufferSize::Fixed(1_024_u32.clamp(*min, *max)),
+            SupportedBufferSize::Unknown => BufferSize::Default,
+        };
+        let mut config = supported.config();
+        config.buffer_size = buffer_size;
         let (commands, receiver) = mpsc::channel();
 
         let stream = match supported.sample_format() {
@@ -232,12 +259,16 @@ impl AudioEngine {
         pitch: u8,
         synth: SimpleWaveformSynth,
         effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
     ) -> Result<(), String> {
         self.commands
             .send(Command::AuditionStart {
                 pitch,
                 synth,
                 effects,
+                arpeggiator,
+                bpm,
             })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
@@ -247,9 +278,28 @@ impl AudioEngine {
         pitch: u8,
         synth: FmSynth,
         effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
     ) -> Result<(), String> {
         self.commands
             .send(Command::AuditionFmStart {
+                pitch,
+                synth,
+                effects,
+                arpeggiator,
+                bpm,
+            })
+            .map_err(|_| "The audio output stream has stopped".to_owned())
+    }
+
+    pub fn audition_drum_start(
+        &self,
+        pitch: u8,
+        synth: DrumMachineSynth,
+        effects: [EffectSlot; 5],
+    ) -> Result<(), String> {
+        self.commands
+            .send(Command::AuditionDrumStart {
                 pitch,
                 synth,
                 effects,
@@ -268,6 +318,8 @@ impl AudioEngine {
         pitch: u8,
         sampler: SampleSynth,
         effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
     ) -> Result<(), String> {
         let Some((path, root_pitch)) =
             select_sample_region(&sampler, pitch, 127, &sampler.articulation)
@@ -292,6 +344,8 @@ impl AudioEngine {
                 sampler,
                 sample,
                 effects,
+                arpeggiator,
+                bpm,
             })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
@@ -380,6 +434,7 @@ impl PlaybackPlan {
             let instrument = match &channel.kind {
                 TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
                 TrackKind::Fm { synth } => RenderInstrument::Fm(*synth),
+                TrackKind::DrumMachine { synth } => RenderInstrument::DrumMachine(*synth),
                 TrackKind::Sampler { sampler } => {
                     if sampler.path.is_none() && sampler.regions.is_empty() {
                         continue;
@@ -410,6 +465,7 @@ impl PlaybackPlan {
                         sample
                     };
                     channel_voices.push(Voice {
+                        pitch: 60,
                         start_sample: (f32::from(clip.start_step) * samples_per_step).round()
                             as u64,
                         note_off_sample: (f32::from(clip.start_step + clip.length_steps)
@@ -451,6 +507,7 @@ impl PlaybackPlan {
                                     pitch_frequency(note.pitch, synth.pitch_shift)
                                 }
                                 RenderInstrument::Fm(_) => pitch_frequency(note.pitch, 0),
+                                RenderInstrument::DrumMachine(_) => 0.0,
                                 RenderInstrument::Sampler { sampler } => {
                                     let (_, root_pitch) = select_sample_region(
                                         sampler,
@@ -492,8 +549,10 @@ impl PlaybackPlan {
                                 }
                                 RenderInstrument::Synth(_) => None,
                                 RenderInstrument::Fm(_) => None,
+                                RenderInstrument::DrumMachine(_) => None,
                             };
                             channel_voices.push(Voice {
+                                pitch: note.pitch,
                                 start_sample: (f32::from(start_step) * samples_per_step).round()
                                     as u64,
                                 note_off_sample: (f32::from(end_step) * samples_per_step).round()
@@ -533,6 +592,8 @@ impl PlaybackPlan {
                     effects: EffectChain::new(channel.effects, sample_rate),
                     instrument,
                     voices: channel_voices,
+                    next_drum_voice: 0,
+                    active_drum_voices: Vec::new(),
                 });
             }
         }
@@ -558,6 +619,7 @@ impl PlaybackPlan {
         let instrument = match &channel.kind {
             TrackKind::Instrument { synth } => RenderInstrument::Synth(*synth),
             TrackKind::Fm { synth } => RenderInstrument::Fm(*synth),
+            TrackKind::DrumMachine { synth } => RenderInstrument::DrumMachine(*synth),
             TrackKind::Sampler { sampler } => {
                 if sampler.path.is_none() && sampler.regions.is_empty() {
                     return Err("Load a WAV into the sampler first".to_owned());
@@ -579,6 +641,7 @@ impl PlaybackPlan {
                         pitch_frequency(note.pitch, synth.pitch_shift)
                     }
                     RenderInstrument::Fm(_) => pitch_frequency(note.pitch, 0),
+                    RenderInstrument::DrumMachine(_) => 0.0,
                     RenderInstrument::Sampler { sampler } => {
                         let (_, root_pitch) = select_sample_region(
                             sampler,
@@ -610,8 +673,10 @@ impl PlaybackPlan {
                     }
                     RenderInstrument::Synth(_) => None,
                     RenderInstrument::Fm(_) => None,
+                    RenderInstrument::DrumMachine(_) => None,
                 };
                 Ok(Voice {
+                    pitch: note.pitch,
                     start_sample: (f32::from(note.start_step) * samples_per_step).round() as u64,
                     note_off_sample: (f32::from(note.start_step + note.length_steps)
                         * samples_per_step)
@@ -645,9 +710,36 @@ impl PlaybackPlan {
                 instrument,
                 voices,
                 effects,
+                next_drum_voice: 0,
+                active_drum_voices: Vec::new(),
             }],
             loop_samples: (f32::from(source.length_steps) * samples_per_step).round() as u64,
         })
+    }
+}
+
+impl ChannelPlan {
+    fn reset_drum_schedule(&mut self, position: u64, sample_rate: f32) {
+        self.active_drum_voices.clear();
+        let RenderInstrument::DrumMachine(synth) = &self.instrument else {
+            return;
+        };
+        self.next_drum_voice = self
+            .voices
+            .partition_point(|voice| voice.start_sample <= position);
+        self.active_drum_voices.extend(
+            self.voices[..self.next_drum_voice]
+                .iter()
+                .filter(|voice| {
+                    position - voice.start_sample
+                        < drum_voice_duration_samples(synth, voice.pitch, sample_rate)
+                })
+                .map(|voice| ActiveDrumVoice {
+                    pitch: voice.pitch,
+                    start_sample: voice.start_sample,
+                    gain: voice.gain,
+                }),
+        );
     }
 }
 
@@ -682,6 +774,13 @@ struct Renderer {
     audition_effects: Option<EffectChain>,
     audition_samples: Vec<AuditionSampleVoice>,
     audition_fm: Vec<AuditionFmVoice>,
+    audition_drums: Vec<AuditionDrumVoice>,
+    held_arpeggiator_notes: Vec<HeldArpeggiatorNote>,
+    arpeggiator: ArpeggiatorSettings,
+    arpeggiator_bpm: f32,
+    arpeggiator_step_remaining: u64,
+    arpeggiator_gate_remaining: u64,
+    arpeggiator_index: usize,
 }
 
 struct AuditionVoice {
@@ -714,6 +813,29 @@ struct AuditionFmVoice {
     feedback: f32,
 }
 
+struct AuditionDrumVoice {
+    pitch: u8,
+    synth: DrumMachineSynth,
+    elapsed: u64,
+}
+
+#[derive(Clone)]
+enum HeldArpeggiatorInstrument {
+    Synth(SimpleWaveformSynth),
+    Fm(FmSynth),
+    Sampler {
+        sampler: SampleSynth,
+        sample: Arc<SampleBuffer>,
+        root_pitch: u8,
+    },
+}
+
+#[derive(Clone)]
+struct HeldArpeggiatorNote {
+    pitch: u8,
+    instrument: HeldArpeggiatorInstrument,
+}
+
 impl Renderer {
     fn new(receiver: Receiver<Command>, sample_rate: f32) -> Self {
         Self {
@@ -727,6 +849,13 @@ impl Renderer {
             audition_effects: None,
             audition_samples: Vec::with_capacity(40),
             audition_fm: Vec::with_capacity(40),
+            audition_drums: Vec::with_capacity(40),
+            held_arpeggiator_notes: Vec::new(),
+            arpeggiator: ArpeggiatorSettings::default(),
+            arpeggiator_bpm: 120.0,
+            arpeggiator_step_remaining: 0,
+            arpeggiator_gate_remaining: 0,
+            arpeggiator_index: 0,
         }
     }
 
@@ -767,8 +896,11 @@ impl Renderer {
                     }
                 }
                 Command::Seek(position) => {
-                    if let Some(plan) = &self.plan {
+                    if let Some(plan) = &mut self.plan {
                         self.position = position.min(plan.loop_samples.saturating_sub(1));
+                        for channel in &mut plan.channels {
+                            channel.reset_drum_schedule(self.position, self.sample_rate);
+                        }
                     }
                 }
                 Command::SetLoopRange(range) => self.loop_range = range,
@@ -776,12 +908,38 @@ impl Renderer {
                     pitch,
                     synth,
                     effects,
-                } => self.start_audition(pitch, synth, effects),
+                    arpeggiator,
+                    bpm,
+                } => {
+                    if arpeggiator.enabled {
+                        self.hold_arpeggiator_note(
+                            pitch,
+                            HeldArpeggiatorInstrument::Synth(synth),
+                            effects,
+                            arpeggiator,
+                            bpm,
+                        );
+                    } else {
+                        self.start_audition(pitch, synth, effects);
+                    }
+                }
                 Command::AuditionFmStart {
                     pitch,
                     synth,
                     effects,
+                    arpeggiator,
+                    bpm,
                 } => {
+                    if arpeggiator.enabled {
+                        self.hold_arpeggiator_note(
+                            pitch,
+                            HeldArpeggiatorInstrument::Fm(synth),
+                            effects,
+                            arpeggiator,
+                            bpm,
+                        );
+                        continue;
+                    }
                     self.start_audition_effects(effects);
                     self.audition_fm.retain(|voice| voice.pitch != pitch);
                     self.audition_fm.push(AuditionFmVoice {
@@ -792,7 +950,21 @@ impl Renderer {
                         feedback: 0.0,
                     });
                 }
+                Command::AuditionDrumStart {
+                    pitch,
+                    synth,
+                    effects,
+                } => {
+                    self.start_audition_effects(effects);
+                    self.audition_drums.push(AuditionDrumVoice {
+                        pitch,
+                        synth,
+                        elapsed: 0,
+                    });
+                }
                 Command::AuditionStop { pitch } => {
+                    self.held_arpeggiator_notes
+                        .retain(|note| note.pitch != pitch);
                     for voice in self
                         .audition_voices
                         .iter_mut()
@@ -824,7 +996,23 @@ impl Renderer {
                     sampler,
                     sample,
                     effects,
+                    arpeggiator,
+                    bpm,
                 } => {
+                    if arpeggiator.enabled {
+                        self.hold_arpeggiator_note(
+                            pitch,
+                            HeldArpeggiatorInstrument::Sampler {
+                                sampler,
+                                sample,
+                                root_pitch,
+                            },
+                            effects,
+                            arpeggiator,
+                            bpm,
+                        );
+                        continue;
+                    }
                     self.start_audition_effects(effects);
                     let playback_rate = 2.0_f32
                         .powf((f32::from(pitch) - f32::from(root_pitch)) / 12.0)
@@ -882,13 +1070,128 @@ impl Renderer {
         if self.audition_voices.is_empty()
             && self.audition_fm.is_empty()
             && self.audition_samples.is_empty()
+            && self.audition_drums.is_empty()
+            && self.held_arpeggiator_notes.is_empty()
         {
             self.audition_effects = Some(EffectChain::new(effects, self.sample_rate));
         }
     }
 
+    fn hold_arpeggiator_note(
+        &mut self,
+        pitch: u8,
+        instrument: HeldArpeggiatorInstrument,
+        effects: [EffectSlot; 5],
+        arpeggiator: ArpeggiatorSettings,
+        bpm: f32,
+    ) {
+        self.start_audition_effects(effects);
+        self.arpeggiator = arpeggiator;
+        self.arpeggiator_bpm = bpm;
+        self.held_arpeggiator_notes
+            .retain(|note| note.pitch != pitch);
+        self.held_arpeggiator_notes
+            .push(HeldArpeggiatorNote { pitch, instrument });
+        if self.held_arpeggiator_notes.len() == 1 {
+            self.arpeggiator_step_remaining = 0;
+            self.arpeggiator_index = 0;
+        }
+    }
+
+    fn advance_arpeggiator(&mut self) {
+        if self.arpeggiator_gate_remaining > 0 {
+            self.arpeggiator_gate_remaining -= 1;
+            if self.arpeggiator_gate_remaining == 0 {
+                self.release_audition_voices();
+            }
+        }
+        if self.held_arpeggiator_notes.is_empty() {
+            return;
+        }
+        if self.arpeggiator_step_remaining > 0 {
+            self.arpeggiator_step_remaining -= 1;
+            return;
+        }
+
+        let sequence = arpeggiator_sequence(&self.held_arpeggiator_notes, self.arpeggiator);
+        if sequence.is_empty() {
+            return;
+        }
+        let note = sequence[self.arpeggiator_index % sequence.len()].clone();
+        self.arpeggiator_index = (self.arpeggiator_index
+            + usize::from(self.arpeggiator.note_skip.max(1)))
+            % sequence.len();
+        match note.instrument {
+            HeldArpeggiatorInstrument::Synth(synth) => {
+                self.start_audition(note.pitch, synth, DEFAULT_EFFECTS);
+            }
+            HeldArpeggiatorInstrument::Fm(synth) => {
+                self.audition_fm.push(AuditionFmVoice {
+                    pitch: note.pitch,
+                    synth,
+                    elapsed: 0,
+                    released_at: None,
+                    feedback: 0.0,
+                });
+            }
+            HeldArpeggiatorInstrument::Sampler {
+                sampler,
+                sample,
+                root_pitch,
+            } => {
+                let playback_rate = 2.0_f32
+                    .powf((f32::from(note.pitch) - f32::from(root_pitch)) / 12.0)
+                    * sampler.speed;
+                self.audition_samples.push(AuditionSampleVoice {
+                    pitch: note.pitch,
+                    sampler,
+                    sample,
+                    playback_rate,
+                    elapsed: 0,
+                    released_at: None,
+                    filter: FilterState::default(),
+                    finished: false,
+                });
+            }
+        }
+        let step_samples = (self.sample_rate * 60.0
+            / self.arpeggiator_bpm.max(1.0)
+            / f32::from(self.arpeggiator.steps_per_beat.max(1)))
+        .round() as u64;
+        self.arpeggiator_step_remaining = step_samples.max(1);
+        self.arpeggiator_gate_remaining =
+            (step_samples as f32 * self.arpeggiator.gate.clamp(0.05, 1.0)).round() as u64;
+    }
+
+    fn release_audition_voices(&mut self) {
+        for voice in self
+            .audition_voices
+            .iter_mut()
+            .filter(|voice| voice.released_at.is_none())
+        {
+            let level = held_envelope(&voice.synth, voice.elapsed, self.sample_rate);
+            voice.released_at = Some((voice.elapsed, level));
+        }
+        for voice in self
+            .audition_fm
+            .iter_mut()
+            .filter(|voice| voice.released_at.is_none())
+        {
+            voice.released_at = Some(voice.elapsed);
+        }
+        for voice in self
+            .audition_samples
+            .iter_mut()
+            .filter(|voice| voice.released_at.is_none())
+        {
+            let level = held_sample_envelope(&voice.sampler, voice.elapsed, self.sample_rate);
+            voice.released_at = Some((voice.elapsed, level));
+        }
+    }
+
     fn next_frame(&mut self) -> [f32; 2] {
         let mut output = [0.0, 0.0];
+        self.advance_arpeggiator();
         if !self.paused
             && let Some(plan) = &mut self.plan
         {
@@ -958,6 +1261,33 @@ impl Renderer {
                             add_panned(&mut channel_output, raw, synth.pan);
                         }
                     }
+                    RenderInstrument::DrumMachine(synth) => {
+                        while channel.next_drum_voice < channel.voices.len()
+                            && channel.voices[channel.next_drum_voice].start_sample <= self.position
+                        {
+                            let voice = &channel.voices[channel.next_drum_voice];
+                            channel.active_drum_voices.push(ActiveDrumVoice {
+                                pitch: voice.pitch,
+                                start_sample: voice.start_sample,
+                                gain: voice.gain,
+                            });
+                            channel.next_drum_voice += 1;
+                        }
+                        channel.active_drum_voices.retain(|voice| {
+                            self.position - voice.start_sample
+                                < drum_voice_duration_samples(synth, voice.pitch, self.sample_rate)
+                        });
+                        for voice in &channel.active_drum_voices {
+                            let raw = drum_sample(
+                                synth,
+                                voice.pitch,
+                                self.position - voice.start_sample,
+                                self.sample_rate,
+                            ) * voice.gain
+                                * synth.master_level;
+                            add_panned(&mut channel_output, raw, synth.pan);
+                        }
+                    }
                     RenderInstrument::Sampler { sampler } => {
                         for voice in &mut channel.voices {
                             if self.position < voice.start_sample {
@@ -1022,6 +1352,7 @@ impl Renderer {
                     for voice in &mut channel.voices {
                         voice.filter = FilterState::default();
                     }
+                    channel.reset_drum_schedule(self.position, self.sample_rate);
                 }
             }
         }
@@ -1128,6 +1459,14 @@ impl Renderer {
                 voice.elapsed < released_at + release
             })
         });
+        for voice in &mut self.audition_drums {
+            let raw = drum_sample(&voice.synth, voice.pitch, voice.elapsed, self.sample_rate)
+                * voice.synth.master_level;
+            add_panned(&mut audition_output, raw, voice.synth.pan);
+            voice.elapsed += 1;
+        }
+        self.audition_drums
+            .retain(|voice| voice.elapsed < ms_samples(2_500.0, self.sample_rate));
         if let Some(effects) = &mut self.audition_effects {
             let effected = effects.process(audition_output, self.sample_rate);
             output[0] += effected[0];
@@ -1363,6 +1702,44 @@ fn oscillator_sample(
         / f32::from(synth.layer_count)
 }
 
+fn drum_sample(synth: &DrumMachineSynth, pitch: u8, elapsed: u64, sample_rate: f32) -> f32 {
+    let Some(kind) = DrumVoiceKind::from_midi_pitch(pitch) else {
+        return 0.0;
+    };
+    let voice = synth.voices[kind.index()];
+    let time = elapsed as f32 / sample_rate;
+    let tone_decay = (-time * 1_000.0 / voice.tone_decay_ms.max(1.0)).exp();
+    let noise_decay = (-time * 1_000.0 / voice.noise_decay_ms.max(1.0)).exp();
+    if tone_decay < 0.000_1 && noise_decay < 0.000_1 {
+        return 0.0;
+    }
+    let pitch_envelope = (-time * 35.0).exp();
+    let frequency = voice.tone_hz + voice.pitch_drop_hz * pitch_envelope;
+    let phase = std::f32::consts::TAU * time * frequency;
+    let tone = match kind {
+        DrumVoiceKind::ClosedHat
+        | DrumVoiceKind::OpenHat
+        | DrumVoiceKind::Crash
+        | DrumVoiceKind::Ride => {
+            (phase.sin() + (phase * 1.447).sin() + (phase * 1.731).sin()) / 3.0
+        }
+        _ => phase.sin(),
+    };
+    let noise = noise_sample(elapsed as u32 ^ (u32::from(pitch) << 24));
+    (tone * voice.tone_level * tone_decay + noise * voice.noise_level * noise_decay).tanh()
+}
+
+fn drum_voice_duration_samples(synth: &DrumMachineSynth, pitch: u8, sample_rate: f32) -> u64 {
+    let Some(kind) = DrumVoiceKind::from_midi_pitch(pitch) else {
+        return 0;
+    };
+    let voice = synth.voices[kind.index()];
+    ms_samples(
+        voice.tone_decay_ms.max(voice.noise_decay_ms) * 7.0,
+        sample_rate,
+    )
+}
+
 fn fm_sample(
     synth: &FmSynth,
     elapsed: u64,
@@ -1461,7 +1838,7 @@ fn pattern_filter_cutoff(
     let parameter = match instrument {
         RenderInstrument::Synth(_) => AutomationParameter::SynthFilterCutoff,
         RenderInstrument::Sampler { .. } => AutomationParameter::SamplerFilterCutoff,
-        RenderInstrument::Fm(_) => return None,
+        RenderInstrument::Fm(_) | RenderInstrument::DrumMachine(_) => return None,
     };
     pattern
         .automation
@@ -1628,6 +2005,45 @@ fn glide_frequency(from: f32, to: f32, elapsed: u64, glide_samples: u64) -> f32 
     }
 }
 
+fn arpeggiator_sequence(
+    held: &[HeldArpeggiatorNote],
+    settings: ArpeggiatorSettings,
+) -> Vec<HeldArpeggiatorNote> {
+    let mut chord = held.to_vec();
+    chord.sort_by_key(|note| note.pitch);
+    let mut ascending = Vec::with_capacity(chord.len() * usize::from(settings.octaves.max(1)));
+    for octave in 0..settings.octaves.max(1) {
+        for note in &chord {
+            let Some(pitch) = note.pitch.checked_add(octave.saturating_mul(12)) else {
+                continue;
+            };
+            if pitch <= 127 {
+                let mut note = note.clone();
+                note.pitch = pitch;
+                ascending.push(note);
+            }
+        }
+    }
+    match settings.order {
+        ArpeggiatorOrder::Up => ascending,
+        ArpeggiatorOrder::Down => {
+            ascending.reverse();
+            ascending
+        }
+        ArpeggiatorOrder::UpDown => {
+            if ascending.len() > 2 {
+                let descending = ascending[1..ascending.len() - 1]
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                ascending.extend(descending);
+            }
+            ascending
+        }
+    }
+}
+
 fn ms_samples(milliseconds: f32, sample_rate: f32) -> u64 {
     (milliseconds * sample_rate / 1_000.0).round() as u64
 }
@@ -1641,16 +2057,18 @@ fn add_panned(output: &mut [f32; 2], sample: f32, pan: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectChain, PlaybackPlan, RenderInstrument, SampleBuffer, add_panned, export_wav,
-        fm_sample, glide_frequency, held_envelope, held_sample_envelope, note_envelope,
+        EffectChain, HeldArpeggiatorInstrument, HeldArpeggiatorNote, PlaybackPlan,
+        RenderInstrument, Renderer, SampleBuffer, add_panned, arpeggiator_sequence, drum_sample,
+        export_wav, fm_sample, glide_frequency, held_envelope, held_sample_envelope, note_envelope,
         pattern_articulation, pitch_frequency, sampler_frame, select_sample_region,
     };
     use crate::model::{
-        AutomationLane, AutomationParameter, AutomationPoint, AutomationValue, DEFAULT_EFFECTS,
-        EffectKind, Pattern, Project, TrackKind,
+        ArpeggiatorOrder, ArpeggiatorSettings, AutomationLane, AutomationParameter,
+        AutomationPoint, AutomationValue, DEFAULT_EFFECTS, EffectKind, Pattern, Project, TrackKind,
     };
     use crate::synths::{
-        FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth,
+        DrumMachineSynth, FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion, SampleSynth,
+        SimpleWaveformSynth,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1708,6 +2126,26 @@ mod tests {
         assert!(stack.is_finite());
         assert!(additive.is_finite());
         assert!((stack - additive).abs() > f32::EPSILON);
+    }
+
+    #[test]
+    fn drum_kits_produce_finite_distinct_kicks_that_decay() {
+        let rock = DrumMachineSynth::PRESETS[0].synth;
+        let house = DrumMachineSynth::PRESETS
+            .iter()
+            .find(|preset| preset.name == "House")
+            .expect("the house kit should exist")
+            .synth;
+
+        let rock_attack = drum_sample(&rock, 36, 8, 48_000.0);
+        let house_attack = drum_sample(&house, 36, 8, 48_000.0);
+        let rock_tail = drum_sample(&rock, 36, 96_000, 48_000.0);
+
+        assert!(rock_attack.is_finite());
+        assert!(house_attack.is_finite());
+        assert!((rock_attack - house_attack).abs() > 0.001);
+        assert!(rock_tail.abs() < 0.001);
+        assert_eq!(drum_sample(&rock, 37, 8, 48_000.0), 0.0);
     }
 
     #[test]
@@ -1806,6 +2244,80 @@ mod tests {
             plan.channels[0].effects.slots[4].kind,
             EffectKind::Reverb { .. }
         ));
+    }
+
+    #[test]
+    fn drum_machine_pattern_schedules_mapped_drum_voices() {
+        let mut project = Project::default();
+        project.add_drum_machine();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 36, 0, 1, 127)
+            .expect("drum pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
+
+        let plan = PlaybackPlan::from_project(&project, 48_000.0)
+            .expect("drum project should build a playback plan");
+
+        assert!(matches!(
+            plan.channels[0].instrument,
+            RenderInstrument::DrumMachine(_)
+        ));
+        assert_eq!(plan.channels[0].voices[0].pitch, 36);
+    }
+
+    #[test]
+    fn drum_renderer_removes_hits_after_their_synthesized_tail() {
+        let mut project = Project::default();
+        project.add_drum_machine();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 36, 0, 1, 127)
+            .expect("drum pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
+        let plan = PlaybackPlan::from_project(&project, 1_000.0)
+            .expect("drum project should build a playback plan");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut renderer = Renderer::new(receiver, 1_000.0);
+        renderer.plan = Some(plan);
+
+        for _ in 0..3_000 {
+            renderer.next_frame();
+        }
+
+        let channel = &renderer
+            .plan
+            .as_ref()
+            .expect("renderer should retain its plan")
+            .channels[0];
+        assert_eq!(channel.next_drum_voice, 1);
+        assert!(channel.active_drum_voices.is_empty());
+    }
+
+    #[test]
+    fn arpeggiator_only_sequences_held_pitch_classes_and_their_octaves() {
+        let held = [60, 64, 67].map(|pitch| HeldArpeggiatorNote {
+            pitch,
+            instrument: HeldArpeggiatorInstrument::Synth(SimpleWaveformSynth::default()),
+        });
+        let settings = ArpeggiatorSettings {
+            enabled: true,
+            order: ArpeggiatorOrder::UpDown,
+            octaves: 2,
+            ..ArpeggiatorSettings::default()
+        };
+
+        let pitches = arpeggiator_sequence(&held, settings)
+            .iter()
+            .map(|note| note.pitch)
+            .collect::<Vec<_>>();
+
+        assert_eq!(pitches, [60, 64, 67, 72, 76, 79, 76, 72, 67, 64]);
+        assert!(
+            pitches
+                .iter()
+                .all(|pitch| [0, 4, 7].contains(&(pitch % 12)))
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::synths::{FmSynth, SampleSynth, SimpleWaveformSynth};
+use crate::synths::{DrumMachineSynth, FmSynth, SampleSynth, SimpleWaveformSynth};
 
 pub const STEPS_PER_BEAT: u16 = 8;
 pub const STEPS_PER_BAR: u16 = STEPS_PER_BEAT * 4;
@@ -96,6 +96,48 @@ pub const DEFAULT_EFFECTS: [EffectSlot; 5] = [
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArpeggiatorOrder {
+    Up,
+    Down,
+    UpDown,
+}
+
+impl ArpeggiatorOrder {
+    pub const ALL: [Self; 3] = [Self::Up, Self::Down, Self::UpDown];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::UpDown => "Up/down",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ArpeggiatorSettings {
+    pub enabled: bool,
+    pub steps_per_beat: u8,
+    pub order: ArpeggiatorOrder,
+    pub octaves: u8,
+    pub note_skip: u8,
+    pub gate: f32,
+}
+
+impl Default for ArpeggiatorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            steps_per_beat: 2,
+            order: ArpeggiatorOrder::Up,
+            octaves: 1,
+            note_skip: 1,
+            gate: 0.75,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterKind {
     Off,
     LowPass,
@@ -120,6 +162,7 @@ impl FilterKind {
 pub enum TrackKind {
     Instrument { synth: SimpleWaveformSynth },
     Fm { synth: FmSynth },
+    DrumMachine { synth: DrumMachineSynth },
     Sampler { sampler: SampleSynth },
     Sample,
 }
@@ -263,6 +306,7 @@ pub struct Track {
     pub muted: bool,
     pub solo: bool,
     pub effects: [EffectSlot; 5],
+    pub arpeggiator: ArpeggiatorSettings,
     pub rendered_from: Option<u64>,
     next_clip_id: u64,
 }
@@ -280,6 +324,7 @@ impl Track {
             muted: false,
             solo: false,
             effects: DEFAULT_EFFECTS,
+            arpeggiator: ArpeggiatorSettings::default(),
             rendered_from: None,
             next_clip_id: 1,
         }
@@ -300,6 +345,7 @@ impl Track {
             muted: false,
             solo: false,
             effects: DEFAULT_EFFECTS,
+            arpeggiator: ArpeggiatorSettings::default(),
             rendered_from: None,
             next_clip_id: 1,
         };
@@ -317,6 +363,7 @@ impl Track {
             muted: false,
             solo: false,
             effects: DEFAULT_EFFECTS,
+            arpeggiator: ArpeggiatorSettings::default(),
             rendered_from: None,
             next_clip_id: 1,
         }
@@ -334,6 +381,25 @@ impl Track {
             muted: false,
             solo: false,
             effects: DEFAULT_EFFECTS,
+            arpeggiator: ArpeggiatorSettings::default(),
+            rendered_from: None,
+            next_clip_id: 1,
+        }
+    }
+
+    pub fn drum_machine(id: u64, source_id: u64, name: String) -> Self {
+        Self {
+            id,
+            name,
+            kind: TrackKind::DrumMachine {
+                synth: DrumMachineSynth::default(),
+            },
+            source_id,
+            clips: Vec::new(),
+            muted: false,
+            solo: false,
+            effects: DEFAULT_EFFECTS,
+            arpeggiator: ArpeggiatorSettings::default(),
             rendered_from: None,
             next_clip_id: 1,
         }
@@ -457,6 +523,34 @@ impl Project {
         });
         self.tracks
             .push(Track::fm(id, source_id, format!("FM synth {number}")));
+        id
+    }
+
+    pub fn add_drum_machine(&mut self) -> u64 {
+        let id = self.next_track_id;
+        self.next_track_id += 1;
+        let source_id = self.next_source_id;
+        self.next_source_id += 1;
+        let number = self
+            .tracks
+            .iter()
+            .filter(|track| matches!(track.kind, TrackKind::DrumMachine { .. }))
+            .count()
+            + 1;
+        self.clip_library.push(ClipSource {
+            id: source_id,
+            channel_id: id,
+            name: format!("Drum pattern {number}"),
+            length_steps: PATTERN_STEPS,
+            kind: ClipSourceKind::Pattern {
+                pattern: Pattern::default(),
+            },
+        });
+        self.tracks.push(Track::drum_machine(
+            id,
+            source_id,
+            format!("Drum machine {number}"),
+        ));
         id
     }
 

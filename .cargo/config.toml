@@ -1,0 +1,4 @@
+[build]
+# This is a personal, locally built DAW, so runtime performance is more useful than
+# producing binaries portable to older CPUs.
+rustflags = ["-C", "target-cpu=native"]

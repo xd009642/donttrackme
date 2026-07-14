@@ -9,14 +9,14 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     audio::{self, AudioEngine},
     model::{
-        ARRANGEMENT_STEPS, AutomationLane, AutomationParameter, AutomationPoint, AutomationValue,
-        Clip, ClipSourceKind, EffectKind, FilterKind, PATTERN_STEPS, Pattern, Project,
-        STEPS_PER_BAR, STEPS_PER_BEAT, TrackKind,
+        ARRANGEMENT_STEPS, ArpeggiatorOrder, ArpeggiatorSettings, AutomationLane,
+        AutomationParameter, AutomationPoint, AutomationValue, Clip, ClipSourceKind, EffectKind,
+        FilterKind, PATTERN_STEPS, Pattern, Project, STEPS_PER_BAR, STEPS_PER_BEAT, TrackKind,
     },
     piano_roll, project_io,
     synths::{
-        FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion, SampleSynth, SimpleWaveformSynth,
-        Waveform, noise_sample,
+        DrumMachineSynth, DrumVoiceKind, FmAlgorithm, FmSynth, SampleLoopMode, SampleRegion,
+        SampleSynth, SimpleWaveformSynth, Waveform, noise_sample,
     },
 };
 
@@ -251,29 +251,44 @@ impl DawApp {
                 .iter()
                 .find(|track| track.id == selected)
                 .and_then(|track| match &track.kind {
-                    TrackKind::Fm { synth } => Some((None, Some(*synth), None, track.effects)),
+                    TrackKind::Fm { synth } => {
+                        Some((None, Some(*synth), None, track.effects, track.arpeggiator))
+                    }
                     TrackKind::Instrument { synth } => {
-                        Some((Some(*synth), None, None, track.effects))
+                        Some((Some(*synth), None, None, track.effects, track.arpeggiator))
                     }
-                    TrackKind::Sampler { sampler } => {
-                        Some((None, None, Some(sampler.clone()), track.effects))
-                    }
+                    TrackKind::Sampler { sampler } => Some((
+                        None,
+                        None,
+                        Some(sampler.clone()),
+                        track.effects,
+                        track.arpeggiator,
+                    )),
+                    TrackKind::DrumMachine { .. } => None,
                     TrackKind::Sample => None,
                 })
         });
 
         if let Some(audio) = &self.audio {
-            if let Some((synth, fm, sampler, effects)) = instrument {
+            if let Some((synth, fm, sampler, effects, arpeggiator)) = instrument {
                 for pitch in desired.difference(&self.auditioned_notes) {
                     let result = if let Some(synth) = synth {
-                        audio.audition_start(*pitch, synth, effects)
+                        audio.audition_start(*pitch, synth, effects, arpeggiator, self.project.bpm)
                     } else if let Some(synth) = fm {
-                        audio.audition_fm_start(*pitch, synth, effects)
+                        audio.audition_fm_start(
+                            *pitch,
+                            synth,
+                            effects,
+                            arpeggiator,
+                            self.project.bpm,
+                        )
                     } else {
                         audio.audition_sample_start(
                             *pitch,
                             sampler.clone().expect("audition instrument is a sampler"),
                             effects,
+                            arpeggiator,
+                            self.project.bpm,
                         )
                     };
                     if let Err(error) = result {
@@ -693,6 +708,7 @@ impl DawApp {
                         track.kind,
                         TrackKind::Instrument { .. }
                             | TrackKind::Fm { .. }
+                            | TrackKind::DrumMachine { .. }
                             | TrackKind::Sampler { .. }
                     )
                 });
@@ -790,6 +806,10 @@ impl DawApp {
                             self.selected_track = Some(self.project.add_fm());
                             ui.close();
                         }
+                        if ui.button("Drum machine").clicked() {
+                            self.selected_track = Some(self.project.add_drum_machine());
+                            ui.close();
+                        }
                         if ui.button("Sampler").clicked() {
                             self.selected_track = Some(self.project.add_sampler());
                             ui.close();
@@ -826,6 +846,7 @@ impl DawApp {
                     let icon = match track.kind {
                         TrackKind::Instrument { .. } => "⌁",
                         TrackKind::Fm { .. } => "≋",
+                        TrackKind::DrumMachine { .. } => "◉",
                         TrackKind::Sampler { .. } => "◫",
                         TrackKind::Sample => "▰",
                     };
@@ -854,6 +875,7 @@ impl DawApp {
                                             track.kind,
                                             TrackKind::Instrument { .. }
                                                 | TrackKind::Fm { .. }
+                                                | TrackKind::DrumMachine { .. }
                                                 | TrackKind::Sampler { .. }
                                         ) && ui
                                             .small_button("⚙")
@@ -886,6 +908,7 @@ impl DawApp {
                                     track.kind,
                                     TrackKind::Instrument { .. }
                                         | TrackKind::Fm { .. }
+                                        | TrackKind::DrumMachine { .. }
                                         | TrackKind::Sampler { .. }
                                 )
                         })
@@ -1111,6 +1134,7 @@ impl DawApp {
                             track.kind,
                             TrackKind::Instrument { .. }
                                 | TrackKind::Fm { .. }
+                                | TrackKind::DrumMachine { .. }
                                 | TrackKind::Sampler { .. }
                         ) && ui.small_button("+ Pattern clip").clicked()
                         {
@@ -1289,6 +1313,7 @@ impl DawApp {
                         let color = match track.kind {
                             TrackKind::Instrument { .. } => Color32::from_rgb(68, 142, 112),
                             TrackKind::Fm { .. } => Color32::from_rgb(76, 128, 174),
+                            TrackKind::DrumMachine { .. } => Color32::from_rgb(180, 104, 72),
                             TrackKind::Sampler { .. } => Color32::from_rgb(137, 91, 166),
                             TrackKind::Sample => Color32::from_rgb(70, 101, 157),
                         };
@@ -1515,6 +1540,9 @@ impl DawApp {
                 TrackKind::Fm { .. } => {
                     ui.label("FM synth");
                 }
+                TrackKind::DrumMachine { .. } => {
+                    ui.label("Drum machine");
+                }
                 TrackKind::Sample => {}
             }
             if !matches!(track.kind, TrackKind::Sample) && ui.button("Settings").clicked() {
@@ -1548,14 +1576,32 @@ impl DawApp {
                 }
                 if let Some(pitch) = output.note_on {
                     let effects = track.effects;
+                    let arpeggiator = track.arpeggiator;
                     let result = match &track.kind {
-                        TrackKind::Instrument { synth } => {
-                            audio.audition_start(pitch, *synth, effects)
+                        TrackKind::Instrument { synth } => audio.audition_start(
+                            pitch,
+                            *synth,
+                            effects,
+                            arpeggiator,
+                            self.project.bpm,
+                        ),
+                        TrackKind::Fm { synth } => audio.audition_fm_start(
+                            pitch,
+                            *synth,
+                            effects,
+                            arpeggiator,
+                            self.project.bpm,
+                        ),
+                        TrackKind::DrumMachine { synth } => {
+                            audio.audition_drum_start(pitch, *synth, effects)
                         }
-                        TrackKind::Fm { synth } => audio.audition_fm_start(pitch, *synth, effects),
-                        TrackKind::Sampler { sampler } => {
-                            audio.audition_sample_start(pitch, sampler.clone(), effects)
-                        }
+                        TrackKind::Sampler { sampler } => audio.audition_sample_start(
+                            pitch,
+                            sampler.clone(),
+                            effects,
+                            arpeggiator,
+                            self.project.bpm,
+                        ),
                         TrackKind::Sample => unreachable!("sample tracks have no piano roll"),
                     };
                     if let Err(error) = result {
@@ -1593,6 +1639,16 @@ impl DawApp {
             self.fm_settings(ui, selected);
             return;
         }
+        if self
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == selected)
+            .is_some_and(|track| matches!(track.kind, TrackKind::DrumMachine { .. }))
+        {
+            self.drum_machine_settings(ui, selected);
+            return;
+        }
         let Some(track) = self
             .project
             .tracks
@@ -1617,6 +1673,10 @@ impl DawApp {
             });
         });
         ui.add_space(12.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(12.0)
+            .show(ui, |ui| arpeggiator_ui(ui, &mut track.arpeggiator));
+        ui.add_space(10.0);
 
         let mut keyboard_output = SynthKeyboardOutput::default();
         let mut mouse_pitch = self.synth_mouse_pitch;
@@ -1919,7 +1979,13 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) = audio.audition_start(pitch, audition_synth, track.effects)
+                && let Err(error) = audio.audition_start(
+                    pitch,
+                    audition_synth,
+                    track.effects,
+                    track.arpeggiator,
+                    self.project.bpm,
+                )
             {
                 self.audio_error = Some(error);
             }
@@ -1949,6 +2015,10 @@ impl DawApp {
             });
         });
         ui.add_space(12.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(12.0)
+            .show(ui, |ui| arpeggiator_ui(ui, &mut track.arpeggiator));
+        ui.add_space(10.0);
         let mut keyboard_output = SynthKeyboardOutput::default();
         let mut mouse_pitch = self.synth_mouse_pitch;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2067,11 +2137,142 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) = audio.audition_fm_start(pitch, audition_synth, track.effects)
+                && let Err(error) = audio.audition_fm_start(
+                    pitch,
+                    audition_synth,
+                    track.effects,
+                    track.arpeggiator,
+                    self.project.bpm,
+                )
             {
                 self.audio_error = Some(error);
             }
         }
+    }
+
+    fn drum_machine_settings(&mut self, ui: &mut egui::Ui, selected: u64) {
+        let Some(track) = self
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == selected)
+        else {
+            return;
+        };
+        let TrackKind::DrumMachine { synth } = &mut track.kind else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.heading("Drum machine");
+            ui.separator();
+            ui.label(&track.name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open piano roll").clicked() {
+                    self.view = View::PianoRoll;
+                }
+            });
+        });
+        ui.add_space(12.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(920.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Kits");
+                    egui::ComboBox::from_id_salt("drum-machine-preset")
+                        .selected_text("Choose kit…")
+                        .show_ui(ui, |ui| {
+                            for preset in DrumMachineSynth::PRESETS {
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        format!("{} · {}", preset.category, preset.name),
+                                    )
+                                    .clicked()
+                                {
+                                    *synth = preset.synth;
+                                    ui.close();
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut synth.master_level, 0.0..=1.0).text("Level"));
+                        ui.add(egui::Slider::new(&mut synth.pan, -1.0..=1.0).text("Pan"));
+                    });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Pads");
+                    ui.weak("Uses General MIDI drum notes in the piano roll.");
+                    ui.horizontal_wrapped(|ui| {
+                        for voice in DrumVoiceKind::ALL {
+                            if ui
+                                .add_sized(
+                                    [105.0, 48.0],
+                                    egui::Button::new(format!(
+                                        "{}\nMIDI {}",
+                                        voice.name(),
+                                        voice.midi_pitch()
+                                    )),
+                                )
+                                .clicked()
+                                && let Some(audio) = &self.audio
+                                && let Err(error) = audio.audition_drum_start(
+                                    voice.midi_pitch(),
+                                    *synth,
+                                    track.effects,
+                                )
+                            {
+                                self.audio_error = Some(error);
+                            }
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.heading("Voice shaping");
+                    for voice_kind in DrumVoiceKind::ALL {
+                        let voice = &mut synth.voices[voice_kind.index()];
+                        egui::CollapsingHeader::new(voice_kind.name()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut voice.tone_hz, 20.0..=10_000.0)
+                                        .logarithmic(true)
+                                        .text("Tone"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut voice.pitch_drop_hz, 0.0..=500.0)
+                                        .text("Pitch drop"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut voice.tone_decay_ms, 10.0..=2_000.0)
+                                        .logarithmic(true)
+                                        .text("Tone decay"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut voice.tone_level, 0.0..=1.0)
+                                        .text("Tone level"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut voice.noise_decay_ms, 10.0..=2_000.0)
+                                        .logarithmic(true)
+                                        .text("Noise decay"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut voice.noise_level, 0.0..=1.0)
+                                        .text("Noise level"),
+                                );
+                            });
+                        });
+                    }
+                });
+        });
     }
 
     fn sampler_settings(&mut self, ui: &mut egui::Ui, selected: u64) {
@@ -2111,6 +2312,10 @@ impl DawApp {
             });
         });
         ui.add_space(12.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(12.0)
+            .show(ui, |ui| arpeggiator_ui(ui, &mut track.arpeggiator));
+        ui.add_space(10.0);
         let mut keyboard_output = SynthKeyboardOutput::default();
         let mut mouse_pitch = self.synth_mouse_pitch;
         let mut trim_drag = self.sampler_trim_drag;
@@ -2387,8 +2592,13 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) =
-                    audio.audition_sample_start(pitch, audition_sampler, track.effects)
+                && let Err(error) = audio.audition_sample_start(
+                    pitch,
+                    audition_sampler,
+                    track.effects,
+                    track.arpeggiator,
+                    self.project.bpm,
+                )
             {
                 self.audio_error = Some(error);
             }
@@ -2421,6 +2631,15 @@ impl DawApp {
                             );
                         });
                         ui.add_space(6.0);
+                        if matches!(
+                            track.kind,
+                            TrackKind::Instrument { .. }
+                                | TrackKind::Fm { .. }
+                                | TrackKind::Sampler { .. }
+                        ) {
+                            arpeggiator_ui(ui, &mut track.arpeggiator);
+                            ui.separator();
+                        }
                         effects_stack_ui(ui, &mut track.effects);
                     });
                 ui.add_space(8.0);
@@ -2429,6 +2648,37 @@ impl DawApp {
                 ui.label("Add an instrument or audio track to create a mixer strip.");
             }
         });
+    }
+}
+
+fn arpeggiator_ui(ui: &mut egui::Ui, arpeggiator: &mut ArpeggiatorSettings) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut arpeggiator.enabled, "Arpeggiator");
+        ui.add_enabled_ui(arpeggiator.enabled, |ui| {
+            egui::ComboBox::from_id_salt(ui.next_auto_id())
+                .selected_text(arpeggiator.order.name())
+                .show_ui(ui, |ui| {
+                    for order in ArpeggiatorOrder::ALL {
+                        ui.selectable_value(&mut arpeggiator.order, order, order.name());
+                    }
+                });
+            egui::ComboBox::from_id_salt(ui.next_auto_id())
+                .selected_text(format!("1/{}", arpeggiator.steps_per_beat * 4))
+                .show_ui(ui, |ui| {
+                    for (steps, label) in [(1, "1/4"), (2, "1/8"), (4, "1/16"), (8, "1/32")] {
+                        ui.selectable_value(&mut arpeggiator.steps_per_beat, steps, label);
+                    }
+                });
+            ui.add(egui::Slider::new(&mut arpeggiator.octaves, 1..=4).text("Octaves"));
+            ui.add(egui::Slider::new(&mut arpeggiator.note_skip, 1..=8).text("Chord-tone skip"))
+                .on_hover_text(
+                    "Advance by this many positions through the held chord and octave notes",
+                );
+            ui.add(egui::Slider::new(&mut arpeggiator.gate, 0.05..=1.0).text("Gate"));
+        });
+    });
+    if arpeggiator.enabled {
+        ui.weak("Only held notes are used; octave copies and chord-tone skips transform that set.");
     }
 }
 
@@ -2546,7 +2796,7 @@ fn pattern_automation_editor(
             AutomationParameter::SynthFilterCutoff,
             synth.filter_cutoff_hz,
         ),
-        TrackKind::Fm { .. } => return,
+        TrackKind::Fm { .. } | TrackKind::DrumMachine { .. } => return,
         TrackKind::Sample => return,
     };
 

@@ -234,6 +234,39 @@ impl FmSynth {
             0.38,
         ),
         preset(
+            "60s muted electric bass",
+            "Bass guitar",
+            FmAlgorithm::TwoPairs,
+            [1.0, 2.0, 2.0, 3.0],
+            [1.0, 0.16, 0.28, 0.07],
+            [520.0, 150.0, 360.0, 110.0],
+            [0.3, 0.0, 0.1, 0.0],
+            [120.0, 70.0, 100.0, 60.0],
+            0.0,
+        ),
+        preset(
+            "70s round electric bass",
+            "Bass guitar",
+            FmAlgorithm::TwoPairs,
+            [1.0, 2.0, 2.0, 3.01],
+            [1.0, 0.24, 0.34, 0.11],
+            [850.0, 260.0, 620.0, 180.0],
+            [0.48, 0.0, 0.2, 0.0],
+            [220.0, 110.0, 180.0, 90.0],
+            0.01,
+        ),
+        preset(
+            "80s bright electric bass",
+            "Bass guitar",
+            FmAlgorithm::TwoPairs,
+            [1.0, 3.0, 2.0, 5.0],
+            [1.0, 0.38, 0.4, 0.2],
+            [680.0, 190.0, 480.0, 140.0],
+            [0.42, 0.0, 0.16, 0.0],
+            [170.0, 90.0, 140.0, 70.0],
+            0.04,
+        ),
+        preset(
             "FM brass",
             "Leads and pads",
             FmAlgorithm::Stack,
@@ -338,6 +371,27 @@ mod tests {
         assert_eq!(preset.synth.operators[3].sustain, 0.0);
         assert!(preset.synth.operators[0].release_ms >= 1_500.0);
         assert!(preset.synth.operators[2].release_ms >= 1_500.0);
+    }
+
+    #[test]
+    fn electric_bass_decades_progress_from_muted_to_bright() {
+        let basses = [
+            "60s muted electric bass",
+            "70s round electric bass",
+            "80s bright electric bass",
+        ]
+        .map(|name| {
+            FmSynth::PRESETS
+                .iter()
+                .find(|preset| preset.name == name)
+                .expect("each electric bass decade preset should exist")
+        });
+
+        assert!(basses.iter().all(|preset| preset.category == "Bass guitar"
+            && preset.synth.algorithm == FmAlgorithm::TwoPairs));
+        assert!(basses[0].synth.operators[0].decay_ms < basses[1].synth.operators[0].decay_ms);
+        assert!(basses[0].synth.operators[1].level < basses[1].synth.operators[1].level);
+        assert!(basses[1].synth.operators[1].level < basses[2].synth.operators[1].level);
     }
 
     #[test]
