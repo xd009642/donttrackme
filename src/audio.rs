@@ -163,9 +163,7 @@ impl AudioEngine {
             .map_err(|error| format!("Could not read the default audio configuration: {error}"))?;
         let sample_rate = supported.sample_rate() as f32;
         let buffer_size = match supported.buffer_size() {
-            SupportedBufferSize::Range { min, max } => {
-                BufferSize::Fixed(1_024_u32.clamp(*min, *max))
-            }
+            SupportedBufferSize::Range { min, max } => BufferSize::Fixed(512_u32.clamp(*min, *max)),
             SupportedBufferSize::Unknown => BufferSize::Default,
         };
         let mut config = supported.config();
