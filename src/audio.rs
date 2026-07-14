@@ -14,8 +14,8 @@ use cpal::{
 };
 
 use crate::model::{
-    ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, DEFAULT_EFFECTS, EffectKind,
-    EffectSlot, FilterKind, Pattern, Project, STEPS_PER_BEAT, TrackKind,
+    ARRANGEMENT_STEPS, AutomationParameter, AutomationValue, EffectKind, EffectSlot, FilterKind,
+    Pattern, Project, STEPS_PER_BEAT, TrackKind,
 };
 use crate::synths::{
     FmAlgorithm, FmOperator, FmSynth, SampleLoopMode, SampleSynth, SimpleWaveformSynth,
@@ -32,10 +32,12 @@ enum Command {
     AuditionStart {
         pitch: u8,
         synth: SimpleWaveformSynth,
+        effects: [EffectSlot; 5],
     },
     AuditionFmStart {
         pitch: u8,
         synth: FmSynth,
+        effects: [EffectSlot; 5],
     },
     AuditionStop {
         pitch: u8,
@@ -45,6 +47,7 @@ enum Command {
         root_pitch: u8,
         sampler: SampleSynth,
         sample: Arc<SampleBuffer>,
+        effects: [EffectSlot; 5],
     },
 }
 
@@ -224,15 +227,33 @@ impl AudioEngine {
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
-    pub fn audition_start(&self, pitch: u8, synth: SimpleWaveformSynth) -> Result<(), String> {
+    pub fn audition_start(
+        &self,
+        pitch: u8,
+        synth: SimpleWaveformSynth,
+        effects: [EffectSlot; 5],
+    ) -> Result<(), String> {
         self.commands
-            .send(Command::AuditionStart { pitch, synth })
+            .send(Command::AuditionStart {
+                pitch,
+                synth,
+                effects,
+            })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
-    pub fn audition_fm_start(&self, pitch: u8, synth: FmSynth) -> Result<(), String> {
+    pub fn audition_fm_start(
+        &self,
+        pitch: u8,
+        synth: FmSynth,
+        effects: [EffectSlot; 5],
+    ) -> Result<(), String> {
         self.commands
-            .send(Command::AuditionFmStart { pitch, synth })
+            .send(Command::AuditionFmStart {
+                pitch,
+                synth,
+                effects,
+            })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
@@ -242,7 +263,12 @@ impl AudioEngine {
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
 
-    pub fn audition_sample_start(&self, pitch: u8, sampler: SampleSynth) -> Result<(), String> {
+    pub fn audition_sample_start(
+        &self,
+        pitch: u8,
+        sampler: SampleSynth,
+        effects: [EffectSlot; 5],
+    ) -> Result<(), String> {
         let Some((path, root_pitch)) =
             select_sample_region(&sampler, pitch, 127, &sampler.articulation)
         else {
@@ -265,6 +291,7 @@ impl AudioEngine {
                 root_pitch,
                 sampler,
                 sample,
+                effects,
             })
             .map_err(|_| "The audio output stream has stopped".to_owned())
     }
@@ -503,15 +530,7 @@ impl PlaybackPlan {
             }
             if !channel_voices.is_empty() {
                 channels.push(ChannelPlan {
-                    effects: match &instrument {
-                        RenderInstrument::Synth(synth) => {
-                            EffectChain::new(synth.effects, sample_rate)
-                        }
-                        RenderInstrument::Sampler { .. } => {
-                            EffectChain::new(DEFAULT_EFFECTS, sample_rate)
-                        }
-                        RenderInstrument::Fm(_) => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
-                    },
+                    effects: EffectChain::new(channel.effects, sample_rate),
                     instrument,
                     voices: channel_voices,
                 });
@@ -620,11 +639,7 @@ impl PlaybackPlan {
                     .min(voices[index].start_sample);
             }
         }
-        let effects = match &instrument {
-            RenderInstrument::Synth(synth) => EffectChain::new(synth.effects, sample_rate),
-            RenderInstrument::Sampler { .. } => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
-            RenderInstrument::Fm(_) => EffectChain::new(DEFAULT_EFFECTS, sample_rate),
-        };
+        let effects = EffectChain::new(channel.effects, sample_rate);
         Ok(Self {
             channels: vec![ChannelPlan {
                 instrument,
@@ -757,8 +772,17 @@ impl Renderer {
                     }
                 }
                 Command::SetLoopRange(range) => self.loop_range = range,
-                Command::AuditionStart { pitch, synth } => self.start_audition(pitch, synth),
-                Command::AuditionFmStart { pitch, synth } => {
+                Command::AuditionStart {
+                    pitch,
+                    synth,
+                    effects,
+                } => self.start_audition(pitch, synth, effects),
+                Command::AuditionFmStart {
+                    pitch,
+                    synth,
+                    effects,
+                } => {
+                    self.start_audition_effects(effects);
                     self.audition_fm.retain(|voice| voice.pitch != pitch);
                     self.audition_fm.push(AuditionFmVoice {
                         pitch,
@@ -799,7 +823,9 @@ impl Renderer {
                     root_pitch,
                     sampler,
                     sample,
+                    effects,
                 } => {
+                    self.start_audition_effects(effects);
                     let playback_rate = 2.0_f32
                         .powf((f32::from(pitch) - f32::from(root_pitch)) / 12.0)
                         * sampler.speed;
@@ -819,10 +845,8 @@ impl Renderer {
         }
     }
 
-    fn start_audition(&mut self, pitch: u8, synth: SimpleWaveformSynth) {
-        if self.audition_voices.is_empty() {
-            self.audition_effects = Some(EffectChain::new(synth.effects, self.sample_rate));
-        }
+    fn start_audition(&mut self, pitch: u8, synth: SimpleWaveformSynth, effects: [EffectSlot; 5]) {
+        self.start_audition_effects(effects);
         let frequency = pitch_frequency(pitch, synth.pitch_shift);
         if synth.mono
             && let Some(voice) = self.audition_voices.first_mut()
@@ -852,6 +876,15 @@ impl Renderer {
             released_at: None,
             filter: FilterState::default(),
         });
+    }
+
+    fn start_audition_effects(&mut self, effects: [EffectSlot; 5]) {
+        if self.audition_voices.is_empty()
+            && self.audition_fm.is_empty()
+            && self.audition_samples.is_empty()
+        {
+            self.audition_effects = Some(EffectChain::new(effects, self.sample_rate));
+        }
     }
 
     fn next_frame(&mut self) -> [f32; 2] {
@@ -1027,11 +1060,6 @@ impl Renderer {
                 voice.elapsed < released_at + ms_samples(voice.synth.release_ms, self.sample_rate)
             })
         });
-        if let Some(effects) = &mut self.audition_effects {
-            let effected = effects.process(audition_output, self.sample_rate);
-            output[0] += effected[0];
-            output[1] += effected[1];
-        }
         for voice in &mut self.audition_samples {
             let envelope = match voice.released_at {
                 Some((released_at, release_level)) => {
@@ -1064,7 +1092,7 @@ impl Renderer {
                 voice.sampler.filter_resonance,
                 self.sample_rate,
             );
-            add_panned(&mut output, filtered, voice.sampler.pan);
+            add_panned(&mut audition_output, filtered, voice.sampler.pan);
             voice.elapsed += 1;
         }
         self.audition_samples.retain(|voice| {
@@ -1085,7 +1113,7 @@ impl Renderer {
                 self.sample_rate,
                 &mut voice.feedback,
             ) * voice.synth.master_level;
-            add_panned(&mut output, raw, voice.synth.pan);
+            add_panned(&mut audition_output, raw, voice.synth.pan);
             voice.elapsed += 1;
         }
         self.audition_fm.retain(|voice| {
@@ -1100,6 +1128,11 @@ impl Renderer {
                 voice.elapsed < released_at + release
             })
         });
+        if let Some(effects) = &mut self.audition_effects {
+            let effected = effects.process(audition_output, self.sample_rate);
+            output[0] += effected[0];
+            output[1] += effected[1];
+        }
 
         [output[0].tanh(), output[1].tanh()]
     }
@@ -1752,6 +1785,27 @@ mod tests {
                 .channels
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn playback_uses_the_instrument_tracks_effect_chain() {
+        let mut project = Project::default();
+        project.add_fm();
+        let pattern_id = project.tracks[0].source_id;
+        project
+            .add_note(pattern_id, 60, 0, 1, 100)
+            .expect("primary pattern should exist");
+        project.ensure_primary_pattern_clip(project.tracks[0].id);
+        project.tracks[0].effects[4].enabled = true;
+
+        let plan = PlaybackPlan::from_project(&project, 48_000.0)
+            .expect("FM project should build a playback plan");
+
+        assert!(plan.channels[0].effects.slots[4].enabled);
+        assert!(matches!(
+            plan.channels[0].effects.slots[4].kind,
+            EffectKind::Reverb { .. }
+        ));
     }
 
     #[test]

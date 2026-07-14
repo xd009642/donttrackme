@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{DEFAULT_EFFECTS, EffectSlot, FilterKind};
+use crate::model::FilterKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Waveform {
@@ -61,7 +61,6 @@ pub struct SimpleWaveformSynth {
     pub filter: FilterKind,
     pub filter_cutoff_hz: f32,
     pub filter_resonance: f32,
-    pub effects: [EffectSlot; 5],
 }
 
 #[derive(Clone, Copy, Debug)]

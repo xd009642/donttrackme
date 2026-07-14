@@ -146,6 +146,17 @@ impl FmSynth {
             0.08,
         ),
         preset(
+            "Warm suitcase piano",
+            "Keys",
+            FmAlgorithm::TwoPairs,
+            [1.0, 2.0, 1.0, 3.01],
+            [1.0, 0.36, 0.72, 0.18],
+            [1_300.0, 420.0, 1_600.0, 650.0],
+            [0.52, 0.0, 0.4, 0.0],
+            [1_700.0, 550.0, 1_900.0, 800.0],
+            0.03,
+        ),
+        preset(
             "Soft tine piano",
             "Keys",
             FmAlgorithm::TwoPairs,
@@ -312,7 +323,22 @@ impl Default for FmSynth {
 
 #[cfg(test)]
 mod tests {
-    use super::FmSynth;
+    use super::{FmAlgorithm, FmSynth};
+
+    #[test]
+    fn warm_suitcase_piano_uses_two_decaying_tine_pairs() {
+        let preset = FmSynth::PRESETS
+            .iter()
+            .find(|preset| preset.name == "Warm suitcase piano")
+            .expect("the warm suitcase piano preset should exist");
+
+        assert_eq!(preset.category, "Keys");
+        assert_eq!(preset.synth.algorithm, FmAlgorithm::TwoPairs);
+        assert_eq!(preset.synth.operators[1].sustain, 0.0);
+        assert_eq!(preset.synth.operators[3].sustain, 0.0);
+        assert!(preset.synth.operators[0].release_ms >= 1_500.0);
+        assert!(preset.synth.operators[2].release_ms >= 1_500.0);
+    }
 
     #[test]
     fn preset_library_covers_core_fm_sound_families() {

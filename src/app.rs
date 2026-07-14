@@ -25,6 +25,7 @@ enum View {
     Arrangement,
     PianoRoll,
     Instrument,
+    Mixer,
 }
 
 #[derive(Default)]
@@ -250,24 +251,29 @@ impl DawApp {
                 .iter()
                 .find(|track| track.id == selected)
                 .and_then(|track| match &track.kind {
-                    TrackKind::Fm { synth } => Some((None, Some(*synth), None)),
-                    TrackKind::Instrument { synth } => Some((Some(*synth), None, None)),
-                    TrackKind::Sampler { sampler } => Some((None, None, Some(sampler.clone()))),
+                    TrackKind::Fm { synth } => Some((None, Some(*synth), None, track.effects)),
+                    TrackKind::Instrument { synth } => {
+                        Some((Some(*synth), None, None, track.effects))
+                    }
+                    TrackKind::Sampler { sampler } => {
+                        Some((None, None, Some(sampler.clone()), track.effects))
+                    }
                     TrackKind::Sample => None,
                 })
         });
 
         if let Some(audio) = &self.audio {
-            if let Some((synth, fm, sampler)) = instrument {
+            if let Some((synth, fm, sampler, effects)) = instrument {
                 for pitch in desired.difference(&self.auditioned_notes) {
                     let result = if let Some(synth) = synth {
-                        audio.audition_start(*pitch, synth)
+                        audio.audition_start(*pitch, synth, effects)
                     } else if let Some(synth) = fm {
-                        audio.audition_fm_start(*pitch, synth)
+                        audio.audition_fm_start(*pitch, synth, effects)
                     } else {
                         audio.audition_sample_start(
                             *pitch,
                             sampler.clone().expect("audition instrument is a sampler"),
+                            effects,
                         )
                     };
                     if let Err(error) = result {
@@ -681,6 +687,7 @@ impl DawApp {
                 }
                 ui.separator();
                 ui.selectable_value(&mut self.view, View::Arrangement, "Arrangement");
+                ui.selectable_value(&mut self.view, View::Mixer, "Mixer");
                 let piano_enabled = self.selected_track_mut().is_some_and(|track| {
                     matches!(
                         track.kind,
@@ -1540,11 +1547,14 @@ impl DawApp {
                     self.audio_error = Some(error);
                 }
                 if let Some(pitch) = output.note_on {
+                    let effects = track.effects;
                     let result = match &track.kind {
-                        TrackKind::Instrument { synth } => audio.audition_start(pitch, *synth),
-                        TrackKind::Fm { synth } => audio.audition_fm_start(pitch, *synth),
+                        TrackKind::Instrument { synth } => {
+                            audio.audition_start(pitch, *synth, effects)
+                        }
+                        TrackKind::Fm { synth } => audio.audition_fm_start(pitch, *synth, effects),
                         TrackKind::Sampler { sampler } => {
-                            audio.audition_sample_start(pitch, sampler.clone())
+                            audio.audition_sample_start(pitch, sampler.clone(), effects)
                         }
                         TrackKind::Sample => unreachable!("sample tracks have no piano roll"),
                     };
@@ -1789,7 +1799,7 @@ impl DawApp {
                     ui.heading("Effects stack");
                     ui.weak("Signal flows from top to bottom after all voices are mixed.");
                     let mut reorder = None;
-                    for (index, effect) in synth.effects.iter_mut().enumerate() {
+                    for (index, effect) in track.effects.iter_mut().enumerate() {
                         egui::Frame::group(ui.style())
                             .inner_margin(8.0)
                             .show(ui, |ui| {
@@ -1884,7 +1894,7 @@ impl DawApp {
                         ui.add_space(4.0);
                     }
                     if let Some((from, to)) = reorder {
-                        synth.effects.swap(from, to);
+                        track.effects.swap(from, to);
                     }
                 });
             ui.add_space(10.0);
@@ -1909,7 +1919,7 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) = audio.audition_start(pitch, audition_synth)
+                && let Err(error) = audio.audition_start(pitch, audition_synth, track.effects)
             {
                 self.audio_error = Some(error);
             }
@@ -2057,7 +2067,7 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) = audio.audition_fm_start(pitch, audition_synth)
+                && let Err(error) = audio.audition_fm_start(pitch, audition_synth, track.effects)
             {
                 self.audio_error = Some(error);
             }
@@ -2377,11 +2387,131 @@ impl DawApp {
                 self.audio_error = Some(error);
             }
             if let Some(pitch) = keyboard_output.note_on
-                && let Err(error) = audio.audition_sample_start(pitch, audition_sampler)
+                && let Err(error) =
+                    audio.audition_sample_start(pitch, audition_sampler, track.effects)
             {
                 self.audio_error = Some(error);
             }
         }
+    }
+
+    fn mixer(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Mixer");
+        ui.weak(
+            "Each strip processes the complete output of its track, after its voices are mixed.",
+        );
+        ui.add_space(10.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for track in &mut self.project.tracks {
+                egui::Frame::group(ui.style())
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(&track.name);
+                            ui.separator();
+                            ui.toggle_value(&mut track.muted, "Mute");
+                            ui.toggle_value(&mut track.solo, "Solo");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Select track").clicked() {
+                                        self.selected_track = Some(track.id);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                        effects_stack_ui(ui, &mut track.effects);
+                    });
+                ui.add_space(8.0);
+            }
+            if self.project.tracks.is_empty() {
+                ui.label("Add an instrument or audio track to create a mixer strip.");
+            }
+        });
+    }
+}
+
+fn effects_stack_ui(ui: &mut egui::Ui, effects: &mut [crate::model::EffectSlot; 5]) {
+    let mut reorder = None;
+    for (index, effect) in effects.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut effect.enabled, "");
+            ui.strong(format!("{}. {}", index + 1, effect.kind.name()));
+            if ui
+                .add_enabled(index > 0, egui::Button::new("↑"))
+                .on_hover_text("Move up")
+                .clicked()
+            {
+                reorder = Some((index, index - 1));
+            }
+            if ui
+                .add_enabled(index + 1 < 5, egui::Button::new("↓"))
+                .on_hover_text("Move down")
+                .clicked()
+            {
+                reorder = Some((index, index + 1));
+            }
+            if !effect.enabled {
+                ui.weak("Bypassed");
+            }
+            ui.add_enabled_ui(effect.enabled, |ui| match &mut effect.kind {
+                EffectKind::Distortion { drive, mix } => {
+                    ui.add(egui::Slider::new(drive, 1.0..=20.0).text("Drive"));
+                    ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                }
+                EffectKind::Delay {
+                    time_ms,
+                    feedback,
+                    mix,
+                } => {
+                    ui.add(
+                        egui::Slider::new(time_ms, 10.0..=1_000.0)
+                            .text("Time")
+                            .suffix(" ms"),
+                    );
+                    ui.add(egui::Slider::new(feedback, 0.0..=0.9).text("Feedback"));
+                    ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                }
+                EffectKind::Chorus {
+                    rate_hz,
+                    depth_ms,
+                    mix,
+                } => {
+                    ui.add(
+                        egui::Slider::new(rate_hz, 0.05..=5.0)
+                            .text("Rate")
+                            .suffix(" Hz"),
+                    );
+                    ui.add(
+                        egui::Slider::new(depth_ms, 1.0..=30.0)
+                            .text("Depth")
+                            .suffix(" ms"),
+                    );
+                    ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                }
+                EffectKind::Tremolo { rate_hz, depth } => {
+                    ui.add(
+                        egui::Slider::new(rate_hz, 0.1..=20.0)
+                            .text("Rate")
+                            .suffix(" Hz"),
+                    );
+                    ui.add(egui::Slider::new(depth, 0.0..=1.0).text("Depth"));
+                }
+                EffectKind::Reverb {
+                    room_size,
+                    damping,
+                    mix,
+                } => {
+                    ui.add(egui::Slider::new(room_size, 0.0..=1.0).text("Room"));
+                    ui.add(egui::Slider::new(damping, 0.0..=0.95).text("Damping"));
+                    ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+                }
+            });
+        });
+    }
+    if let Some((from, to)) = reorder {
+        effects.swap(from, to);
     }
 }
 
@@ -3240,6 +3370,7 @@ impl eframe::App for DawApp {
             View::Arrangement => self.arrangement(ui),
             View::PianoRoll => self.editor(ui),
             View::Instrument => self.instrument_settings(ui),
+            View::Mixer => self.mixer(ui),
         });
         self.tap_tempo_window(&context);
         if self.playing {

@@ -262,6 +262,7 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub muted: bool,
     pub solo: bool,
+    pub effects: [EffectSlot; 5],
     pub rendered_from: Option<u64>,
     next_clip_id: u64,
 }
@@ -278,6 +279,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            effects: DEFAULT_EFFECTS,
             rendered_from: None,
             next_clip_id: 1,
         }
@@ -297,6 +299,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            effects: DEFAULT_EFFECTS,
             rendered_from: None,
             next_clip_id: 1,
         };
@@ -313,6 +316,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            effects: DEFAULT_EFFECTS,
             rendered_from: None,
             next_clip_id: 1,
         }
@@ -329,6 +333,7 @@ impl Track {
             clips: Vec::new(),
             muted: false,
             solo: false,
+            effects: DEFAULT_EFFECTS,
             rendered_from: None,
             next_clip_id: 1,
         }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Project;
 
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
@@ -51,6 +51,7 @@ mod tests {
         let mut project = Project::default();
         project.add_instrument();
         project.bpm = 137.5;
+        project.tracks[0].effects[4].enabled = true;
         let pattern_id = project.tracks[0].source_id;
         project
             .add_note(pattern_id, 72, 3, 5, 91)
@@ -83,6 +84,7 @@ mod tests {
             91
         );
         assert_eq!(loaded.tracks[0].clips.len(), 1);
+        assert!(loaded.tracks[0].effects[4].enabled);
         assert_eq!(loaded.add_note(pattern_id, 60, 0, 1, 100), Some(2));
         assert_eq!(loaded.add_instrument(), 2);
     }

@@ -19,7 +19,6 @@ impl Default for SimpleWaveformSynth {
             filter: FilterKind::Off,
             filter_cutoff_hz: 8_000.0,
             filter_resonance: 0.1,
-            effects: DEFAULT_EFFECTS,
         }
     }
 }
@@ -74,7 +73,6 @@ macro_rules! preset {
                 filter: $filter,
                 filter_cutoff_hz: $cutoff,
                 filter_resonance: 0.15,
-                effects: DEFAULT_EFFECTS,
             },
         }
     }};
@@ -849,4 +847,3 @@ impl SimpleWaveformSynth {
         ),
     ];
 }
-
